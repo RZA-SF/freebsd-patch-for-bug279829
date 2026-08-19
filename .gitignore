@@ -1,0 +1,21 @@
+# Session transcripts saved locally
+session_*.txt
+
+# VS Code workspace file (local dev preference, not project config)
+*.code-workspace
+
+# Claude local settings
+.claude/
+
+# Test suite runtime artifacts — temp dirs/files created by mktemp during test runs
+# (normally cleaned up, but guard against crashes leaving debris)
+tmp.*
+*.tmp
+
+# macOS
+.DS_Store
+
+# vim/emacs swap files
+*.swp
+*.swo
+*~

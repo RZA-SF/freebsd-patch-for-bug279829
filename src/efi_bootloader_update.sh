@@ -1,0 +1,842 @@
+#!/bin/sh
+#
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Copyright (c) 2026 Ronald Pagani Jr.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in
+#    the documentation and/or other materials provided with the
+#    distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS''
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+# PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
+# USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+# OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+# SUCH DAMAGE.
+#
+# efi_bootloader_update.sh — FreeBSD EFI/BIOS Bootloader Updater
+#
+# Automatically updates the EFI bootloader on the EFI System Partition (ESP)
+# and the BIOS bootcode on freebsd-boot partitions during FreeBSD system
+# upgrades.  Addresses FreeBSD bug 279829.
+#
+# Design goals:
+#   - Safe: never blindly overwrites files belonging to other operating systems
+#   - Complete: handles all supported architectures, disk topologies, FS types
+#   - Idempotent: safe to run multiple times; re-running on an up-to-date system
+#     is a no-op with informational output only
+#   - Atomic: uses temp-file + rename to minimise the corruption window on FAT32
+#   - Promote: creates /EFI/FreeBSD/loader.efi and an NVRAM entry when absent,
+#     so future upgrades have a stable, OS-specific path to update
+#
+# Usage (standalone):
+#   sh efi_bootloader_update.sh [--dry-run] [--verbose]
+#
+# Usage (sourced by freebsd-update):
+#   . /usr/libexec/efi_bootloader_update.sh && update_bootloaders
+#
+# Environment overrides:
+#   EFI_LOADER_SRC      Source loader (default: /boot/loader.efi)
+#   EFI_DRY_RUN         Set to 1 for dry-run mode (default: 0)
+#   EFI_VERBOSE         Set to 1 for debug output   (default: 0)
+#   EFI_NVRAM_UPDATE    Set to 0 to skip NVRAM entry management (default: 1)
+#   EFI_BIOS_PMBR       Path to pmbr boot record    (default: /boot/pmbr)
+#   EFI_BIOS_ZFS_BOOT   Path to gptzfsboot          (default: /boot/gptzfsboot)
+#   EFI_BIOS_UFS_BOOT   Path to gptboot             (default: /boot/gptboot)
+#
+
+# Guard against double-sourcing
+[ -n "${_EFI_BOOTLOADER_UPDATE_SH:-}" ] && return 0
+_EFI_BOOTLOADER_UPDATE_SH=1
+
+# ============================================================
+# CONFIGURATION  (overridable via environment)
+# ============================================================
+
+: "${EFI_LOADER_SRC:=/boot/loader.efi}"
+: "${EFI_DRY_RUN:=0}"
+: "${EFI_VERBOSE:=0}"
+: "${EFI_NVRAM_UPDATE:=1}"     # Set to 0 to skip NVRAM boot entry management
+: "${EFI_BIOS_PMBR:=/boot/pmbr}"
+: "${EFI_BIOS_ZFS_BOOT:=/boot/gptzfsboot}"
+: "${EFI_BIOS_UFS_BOOT:=/boot/gptboot}"
+
+# Minimum number of FreeBSD-specific strings that must be present in an EFI
+# binary for it to be classified as a FreeBSD loader (reduces false-positives).
+_EFI_FINGERPRINT_THRESHOLD=2
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+_efi_log()  { echo "freebsd-update: [bootloader] $*" >&2; }
+_efi_info() { _efi_log "INFO:  $*"; }
+_efi_warn() { _efi_log "WARN:  $*" >&2; }
+_efi_err()  { _efi_log "ERROR: $*" >&2; }
+_efi_verb() { [ "${EFI_VERBOSE}" = "1" ] && _efi_log "DEBUG: $*" || true; }
+
+# ============================================================
+# ARCHITECTURE → EFI BINARY MAPPING
+# ============================================================
+
+# Returns the UEFI fallback binary name for the given machine architecture.
+# Argument: output of `uname -m`
+efi_fallback_binary_for_arch() {
+    case "$1" in
+        amd64|x86_64)   echo "BOOTx64.efi"    ;;
+        arm64|aarch64)  echo "BOOTaa64.efi"   ;;
+        i386)           echo "BOOTia32.efi"    ;;
+        riscv64)        echo "BOOTriscv64.efi" ;;
+        *)              return 1               ;;
+    esac
+}
+
+# Returns the fallback binary name for the currently running machine.
+efi_fallback_binary() {
+    local arch
+    arch=$(uname -m 2>/dev/null) || arch="unknown"
+    efi_fallback_binary_for_arch "$arch" || {
+        _efi_warn "Unsupported/unknown architecture for EFI: ${arch}"
+        return 1
+    }
+}
+
+# ============================================================
+# PREREQUISITE CHECKS
+# ============================================================
+
+# Returns:
+#   0  all checks passed — proceed
+#   1  fatal failure     — abort
+#   2  in jail           — skip gracefully (not an error)
+efi_check_prerequisites() {
+    local ok=0
+
+    if [ "$(id -u)" != "0" ]; then
+        _efi_err "Must be run as root"
+        ok=1
+    fi
+
+    if [ "$(sysctl -n security.jail.jailed 2>/dev/null)" = "1" ]; then
+        _efi_warn "Running inside a jail — bootloader update skipped"
+        return 2
+    fi
+
+    if [ ! -f "${EFI_LOADER_SRC}" ]; then
+        _efi_err "Source loader not found: ${EFI_LOADER_SRC}"
+        ok=1
+    elif [ ! -s "${EFI_LOADER_SRC}" ]; then
+        _efi_err "Source loader is empty: ${EFI_LOADER_SRC}"
+        ok=1
+    fi
+
+    return $ok
+}
+
+# ============================================================
+# SYSTEM DETECTION
+# ============================================================
+
+# Returns "UEFI", "BIOS", or "unknown"
+efi_boot_method() {
+    local m
+    m=$(sysctl -n machdep.bootmethod 2>/dev/null) || { echo "unknown"; return; }
+    echo "$m"
+}
+
+# Returns the root filesystem type: "zfs", "ufs", or the raw type string.
+# Handles both FreeBSD mount(8) format:  "dev on / (fstype, opts)"
+# and Linux /proc/mounts format:          "dev on / type fstype (opts)"
+efi_root_fs_type() {
+    mount 2>/dev/null | awk '
+        $3 == "/" {
+            if ($4 ~ /^\(/) {
+                # FreeBSD: field 4 is "(fstype," — strip parens/comma
+                t = $4; sub(/^\(/, "", t); sub(/[,)].*/, "", t); print t
+            } else {
+                # Linux: field 4 is "type", field 5 is the fstype
+                print $5
+            }
+            exit
+        }
+    '
+}
+
+# ============================================================
+# DISK DISCOVERY
+# ============================================================
+
+# Outputs one disk device name per line for every disk that participates in
+# hosting the root filesystem.  Handles ZFS (single, mirror, raidz, gmirror
+# members), UFS, and falls back to a best-effort search when root FS type is
+# not recognised.
+efi_discover_boot_disks() {
+    local root_fs
+    root_fs=$(efi_root_fs_type)
+    _efi_verb "Root filesystem type: ${root_fs}"
+
+    local disks=""
+    case "$root_fs" in
+        zfs)
+            disks=$(efi_zfs_boot_disks) ;;
+        ufs)
+            disks=$(efi_ufs_boot_disks) ;;
+        *)
+            _efi_warn "Unrecognised root FS type '${root_fs}'; trying ZFS then UFS discovery"
+            disks=$(efi_zfs_boot_disks 2>/dev/null) || true
+            [ -z "$disks" ] && disks=$(efi_ufs_boot_disks 2>/dev/null) || true
+            ;;
+    esac
+
+    if [ -z "$disks" ]; then
+        _efi_warn "No boot disks found"
+        return 1
+    fi
+
+    echo "$disks"
+}
+
+# Discover all physical disks that are members of the ZFS root pool.
+# Handles mirrors, raidz, and nested vdevs.  gmirror members are expanded.
+efi_zfs_boot_disks() {
+    local pool
+    pool=$(zfs get -H -o value name / 2>/dev/null | cut -d/ -f1) || {
+        _efi_warn "Cannot determine ZFS root pool name"
+        return 1
+    }
+    _efi_verb "ZFS root pool: ${pool}"
+
+    # Parse `zpool status` config section.  Lines whose first field matches a
+    # known block-device naming pattern are physical vdev leaves.  Virtual vdev
+    # names (mirror-N, raidz*-N, spare, cache, log, NAME header) are skipped.
+    zpool status "$pool" 2>/dev/null | awk '
+        /^config:/  { in_cfg = 1; next }
+        /^errors:/  { in_cfg = 0 }
+        !in_cfg     { next }
+        # Skip the column header and virtual-vdev labels
+        /^[[:space:]]*(NAME|mirror|raidz|spare|cache|log|replacing|removing)/ { next }
+        /^[[:space:]]+[a-z]/ {
+            dev = $1
+            # Strip slice/partition suffix (e.g. nda0p4 → nda0, ada0s1a → ada0)
+            sub(/[sp][0-9]+[a-z]?$/, "", dev)
+            # Emit only recognisable disk device names
+            if (dev ~ /^(da|ada|nda|nvd|vtblk|xbd|mmcsd|cd|md)[0-9]/) print dev
+        }
+    ' | sort -u | while IFS= read -r dev; do
+        # Expand gmirror virtual devices (mirror/gmX) to their member disks
+        case "$dev" in
+            gm[0-9]*)
+                efi_gmirror_members "$dev" ;;
+            *)
+                echo "$dev" ;;
+        esac
+    done | sort -u
+}
+
+# Discover the boot disk from a UFS root via /etc/fstab.
+efi_ufs_boot_disks() {
+    local root_dev
+    root_dev=$(awk '$2 == "/" && $1 !~ /^#/ { print $1; exit }' /etc/fstab 2>/dev/null) || {
+        _efi_warn "Cannot determine root device from /etc/fstab"
+        return 1
+    }
+    root_dev="${root_dev#/dev/}"                   # strip /dev/ prefix
+    case "$root_dev" in                            # strip partition/slice suffix
+        *p[0-9]*)  root_dev="${root_dev%%p[0-9]*}" ;;   # GPT: ada0p2 -> ada0
+        *s[0-9]*)  root_dev="${root_dev%%s[0-9]*}" ;;   # MBR: nda0s1a -> nda0
+    esac
+    [ -n "$root_dev" ] && echo "$root_dev"
+}
+
+# Expand a gmirror device name to its physical member disk names.
+efi_gmirror_members() {
+    local mirror_name="$1"
+    gmirror status 2>/dev/null | awk -v name="$mirror_name" '
+        $0 ~ name { found = 1 }
+        found && /(ACTIVE|PASSIVE|SYNCHRONIZING)/ {
+            dev = $NF
+            gsub(/\(.*\)/, "", dev)      # remove "(STATE)" annotation
+            gsub(/[[:space:]]/, "", dev)
+            sub(/[sp][0-9]+[a-z]?$/, "", dev)   # strip partition suffix
+            if (dev != "") print dev
+        }
+    '
+}
+
+# ============================================================
+# PARTITION DISCOVERY
+# ============================================================
+
+# Output the partition index(es) of type "efi" on the given disk.
+efi_efi_partitions() {
+    local disk="$1"
+    gpart show "$disk" 2>/dev/null | awk '$4 == "efi" { print $3 }'
+}
+
+# Output the partition index(es) of type "freebsd-boot" on the given disk.
+efi_bios_partitions() {
+    local disk="$1"
+    gpart show "$disk" 2>/dev/null | awk '$4 == "freebsd-boot" { print $3 }'
+}
+
+# ============================================================
+# ESP MOUNTING
+# ============================================================
+
+# Module-level state for the current ESP mount operation.
+_efi_esp_mp=""          # Current ESP mountpoint
+_efi_esp_did_mount=0    # 1 if we mounted it (we must unmount)
+_efi_tmp_mounts=""      # All temp mounts we created (space-separated)
+
+# Remove all temporary mounts created by this script.  Called from EXIT trap.
+efi_cleanup_mounts() {
+    local mp
+    for mp in ${_efi_tmp_mounts}; do
+        _efi_verb "Cleanup: unmounting ${mp}"
+        umount "$mp" 2>/dev/null || true
+        rmdir  "$mp" 2>/dev/null || true
+    done
+    _efi_tmp_mounts=""
+}
+
+# Return the current mountpoint for a device, or empty string if not mounted.
+efi_esp_mountpoint() {
+    local device="$1"
+    case "$device" in /dev/*) ;; *) device="/dev/${device}" ;; esac
+    mount 2>/dev/null | awk -v d="$device" '$1 == d { print $3; exit }'
+}
+
+# Mount the EFI System Partition at a temporary directory.
+# Sets _efi_esp_mp and _efi_esp_did_mount.
+# Returns 0 on success, 1 on failure.
+efi_mount_esp() {
+    local disk="$1"
+    local part_index="$2"
+    local device="/dev/${disk}p${part_index}"
+
+    _efi_esp_mp=""
+    _efi_esp_did_mount=0
+
+    # Reuse an existing mount if the device is already mounted.
+    local existing
+    existing=$(efi_esp_mountpoint "$device")
+    if [ -n "$existing" ]; then
+        _efi_verb "ESP ${device} already mounted at ${existing}"
+        _efi_esp_mp="$existing"
+        _efi_esp_did_mount=0
+        return 0
+    fi
+
+    local tmp_mp
+    tmp_mp=$(mktemp -d 2>/dev/null) || {
+        _efi_err "Cannot create temporary mount directory"
+        return 1
+    }
+
+    if [ "${EFI_DRY_RUN}" = "1" ]; then
+        _efi_info "[DRY RUN] Would mount ${device} at ${tmp_mp}"
+        _efi_esp_mp="$tmp_mp"
+        _efi_esp_did_mount=1
+        _efi_tmp_mounts="${_efi_tmp_mounts} ${tmp_mp}"
+        return 0
+    fi
+
+    if ! mount_msdosfs -o noexec -o nosuid "${device}" "${tmp_mp}" 2>/dev/null; then
+        _efi_err "Failed to mount ESP ${device} at ${tmp_mp}"
+        rmdir "$tmp_mp" 2>/dev/null
+        return 1
+    fi
+
+    _efi_esp_mp="$tmp_mp"
+    _efi_esp_did_mount=1
+    _efi_tmp_mounts="${_efi_tmp_mounts} ${tmp_mp}"
+    _efi_verb "Mounted ${device} at ${tmp_mp}"
+    return 0
+}
+
+# Unmount the ESP if this script mounted it; clears state variables.
+efi_unmount_esp() {
+    if [ "${_efi_esp_did_mount}" = "1" ] && [ -n "${_efi_esp_mp}" ]; then
+        if [ "${EFI_DRY_RUN}" != "1" ]; then
+            _efi_verb "Unmounting ESP at ${_efi_esp_mp}"
+            umount "${_efi_esp_mp}" 2>/dev/null || \
+                _efi_warn "Failed to unmount ${_efi_esp_mp}"
+            rmdir  "${_efi_esp_mp}" 2>/dev/null || true
+        fi
+        # Remove from cleanup list
+        _efi_tmp_mounts=$(printf '%s\n' ${_efi_tmp_mounts} | \
+            grep -Fxv "${_efi_esp_mp}" | tr '\n' ' ')
+    fi
+    _efi_esp_mp=""
+    _efi_esp_did_mount=0
+}
+
+# ============================================================
+# LOADER FINGERPRINTING
+# ============================================================
+
+# Returns 0 if the given file appears to be a FreeBSD EFI loader binary.
+# Requires at least _EFI_FINGERPRINT_THRESHOLD of the following strings to
+# be present: "FreeBSD", "loader.efi", "boot/lua".
+# Using multiple strings substantially reduces the false-positive risk that
+# arises from checking only for "FreeBSD" (which could appear in any binary).
+efi_is_freebsd_loader() {
+    local file="$1"
+
+    [ -f "$file" ] || return 1
+    [ -s "$file" ] || return 1   # must be non-empty
+
+    local matches=0 sig
+    for sig in "FreeBSD" "loader.efi" "boot/lua"; do
+        strings "$file" 2>/dev/null | grep -qF "$sig" && \
+            matches=$((matches + 1))
+    done
+
+    _efi_verb "Fingerprint '${file}': ${matches}/${_EFI_FINGERPRINT_THRESHOLD} match(es)"
+    [ "$matches" -ge "${_EFI_FINGERPRINT_THRESHOLD}" ]
+}
+
+# ============================================================
+# SPACE CHECK
+# ============================================================
+
+# Returns 0 if the ESP has enough free space for at least 2 copies of
+# loader.efi (current + new) plus a 64 KiB safety margin.
+efi_check_space() {
+    local esp_mount="$1"
+
+    local src_size
+    src_size=$(stat -f '%z' "${EFI_LOADER_SRC}" 2>/dev/null) || {
+        _efi_err "Cannot stat ${EFI_LOADER_SRC}"
+        return 1
+    }
+
+    local avail_kb
+    avail_kb=$(df -k "$esp_mount" 2>/dev/null | awk 'NR==2 { print $4 }') || {
+        _efi_err "Cannot determine free space on ${esp_mount}"
+        return 1
+    }
+
+    local avail_bytes=$((avail_kb * 1024))
+    # Allow 2× the loader size (temp file + final) plus 64 KiB overhead
+    local required=$((src_size * 2 + 65536))
+
+    if [ "$avail_bytes" -lt "$required" ]; then
+        _efi_err "Insufficient space on ESP: ${avail_bytes} B available, ${required} B needed"
+        _efi_err "Free space on the EFI System Partition and retry"
+        return 1
+    fi
+
+    _efi_verb "ESP space OK: ${avail_bytes} B available, ${required} B needed"
+    return 0
+}
+
+# ============================================================
+# FILE OPERATIONS
+# ============================================================
+
+# Copy src to dst using a temp file + rename to minimise the corruption window
+# on the non-journaled FAT32 filesystem.
+efi_safe_copy() {
+    local src="$1"
+    local dst="$2"
+    local tmp="${dst}.new"
+
+    # _efi_copy_wrote: set to 1 if a write occurred, 0 if skipped (already
+    # current) or dry-run.  Callers use this to count actual writes.
+    _efi_copy_wrote=0
+
+    if [ "${EFI_DRY_RUN}" = "1" ]; then
+        _efi_info "[DRY RUN] Would update: ${dst}"
+        return 0
+    fi
+
+    # Skip the copy if the destination already matches the source.
+    # Avoids unnecessary FAT32 writes on repeated freebsd-update install runs.
+    if [ -f "$dst" ] && cmp -s "$src" "$dst" 2>/dev/null; then
+        _efi_verb "Already up to date: ${dst}"
+        return 0
+    fi
+
+    cp -f "$src" "$tmp" 2>/dev/null || {
+        _efi_err "Copy failed: ${src} → ${tmp}"
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    }
+    sync 2>/dev/null || true
+
+    mv -f "$tmp" "$dst" 2>/dev/null || {
+        _efi_err "Rename failed: ${tmp} → ${dst}"
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    }
+    sync 2>/dev/null || true
+
+    _efi_copy_wrote=1
+    _efi_info "Updated: ${dst}"
+    return 0
+}
+
+# ============================================================
+# EFI PATH MANAGEMENT
+# ============================================================
+
+# Ensure a FreeBSD NVRAM boot entry pointing to /EFI/FreeBSD/loader.efi exists.
+# Non-fatal: many systems boot fine without an explicit NVRAM entry (fallback
+# path covers them) and efibootmgr may not be installed.
+efi_ensure_nvram_entry() {
+    local esp_mount="$1"
+    local freebsd_loader_abs="$2"  # absolute path on mounted ESP
+
+    if [ "${EFI_NVRAM_UPDATE}" != "1" ]; then
+        _efi_verb "EFI_NVRAM_UPDATE=0 — skipping NVRAM boot entry management"
+        return 0
+    fi
+
+    command -v efibootmgr >/dev/null 2>&1 || {
+        _efi_warn "efibootmgr not found — cannot verify NVRAM boot entry"
+        _efi_warn "Ensure UEFI NVRAM has a FreeBSD entry pointing to the loader"
+        return 0
+    }
+
+    # Derive EFI-style path (relative to ESP root, backslashes)
+    local rel_path="${freebsd_loader_abs#${esp_mount}}"
+    local efi_path
+    efi_path=$(echo "$rel_path" | tr '/' '\\')
+
+    # Look for an existing FreeBSD entry that references /EFI/FreeBSD/loader.efi
+    local existing
+    existing=$(efibootmgr -v 2>/dev/null | \
+        grep -i "FreeBSD" | grep -i "loader\.efi") || true
+
+    if [ -n "$existing" ]; then
+        _efi_verb "NVRAM FreeBSD entry already exists"
+        return 0
+    fi
+
+    _efi_info "Adding NVRAM boot entry: FreeBSD → ${efi_path}"
+    if [ "${EFI_DRY_RUN}" = "1" ]; then
+        _efi_info "[DRY RUN] efibootmgr -a -c -l '${freebsd_loader_abs}' -L FreeBSD"
+        return 0
+    fi
+
+    # FreeBSD efibootmgr -l expects a Unix path on the mounted ESP,
+    # not an EFI backslash path.  It resolves the partition and EFI
+    # device path itself.
+    efibootmgr -a -c -l "$freebsd_loader_abs" -L "FreeBSD" >/dev/null 2>&1 || {
+        _efi_warn "efibootmgr failed to create NVRAM entry"
+        _efi_warn "Mount ESP and run: efibootmgr -a -c -l '<esp>/EFI/FreeBSD/loader.efi' -L FreeBSD"
+        return 0   # still non-fatal
+    }
+    _efi_info "NVRAM boot entry created"
+}
+
+# Update all FreeBSD EFI loaders on a mounted ESP, and create the
+# OS-specific /EFI/FreeBSD/loader.efi path + NVRAM entry if absent.
+efi_update_esp() {
+    local esp_mount="$1"
+    local fallback_binary="$2"   # e.g. "BOOTx64.efi"
+    local disk="$3"
+    local part_index="$4"
+
+    local updated=0 errors=0
+
+    # ── 1.  OS-specific path: /EFI/FreeBSD/loader.efi ─────────────────────────
+    #
+    # FAT32 is case-insensitive.  Use case-insensitive find so we handle ESPs
+    # created by installers that chose a different capitalisation.
+
+    local freebsd_dir freebsd_loader
+
+    local found_dir
+    found_dir=$(find "${esp_mount}" -maxdepth 3 -type d \
+        -iname "FreeBSD" 2>/dev/null | head -1)
+
+    if [ -n "$found_dir" ]; then
+        freebsd_dir="$found_dir"
+        freebsd_loader="${freebsd_dir}/loader.efi"
+        efi_safe_copy "${EFI_LOADER_SRC}" "$freebsd_loader" || errors=$((errors + 1))
+        [ "${_efi_copy_wrote:-0}" = "1" ] && updated=$((updated + 1))
+    else
+        # Directory does not exist — create it (the "promote" step)
+        freebsd_dir="${esp_mount}/EFI/FreeBSD"
+        freebsd_loader="${freebsd_dir}/loader.efi"
+        _efi_info "Creating ${freebsd_dir}/ and installing loader"
+        if [ "${EFI_DRY_RUN}" != "1" ]; then
+            mkdir -p "$freebsd_dir" 2>/dev/null || {
+                _efi_err "Cannot create directory: ${freebsd_dir}"
+                errors=$((errors + 1))
+            }
+        fi
+        if [ "$errors" -eq 0 ]; then
+            efi_safe_copy "${EFI_LOADER_SRC}" "$freebsd_loader" || errors=$((errors + 1))
+            [ "${_efi_copy_wrote:-0}" = "1" ] && updated=$((updated + 1))
+        fi
+    fi
+
+    # ── 2.  Fallback path: /EFI/BOOT/<arch>.efi ───────────────────────────────
+    #
+    # Only update if the file already exists AND fingerprints as a FreeBSD loader.
+    # This protects other OSes that may own this path on a shared ESP.
+
+    local boot_dir fallback_file=""
+    local found_boot
+    found_boot=$(find "${esp_mount}/EFI" -maxdepth 1 -type d \
+        -iname "BOOT" 2>/dev/null | head -1) || true
+
+    if [ -n "$found_boot" ]; then
+        boot_dir="$found_boot"
+        fallback_file=$(find "$boot_dir" -maxdepth 1 -type f \
+            -iname "$fallback_binary" 2>/dev/null | head -1) || true
+    fi
+
+    if [ -n "$fallback_file" ]; then
+        if efi_is_freebsd_loader "$fallback_file"; then
+            efi_safe_copy "${EFI_LOADER_SRC}" "$fallback_file" || errors=$((errors + 1))
+            [ "${_efi_copy_wrote:-0}" = "1" ] && updated=$((updated + 1))
+        else
+            _efi_warn "$(basename "$fallback_file") at ${fallback_file} does not fingerprint as FreeBSD — skipping"
+            _efi_warn "Another OS may own this path; FreeBSD will boot via /EFI/FreeBSD/"
+        fi
+    else
+        # No fallback binary at all — create one (common on fresh or BIOS-migrated installs)
+        if [ -z "$found_boot" ]; then
+            boot_dir="${esp_mount}/EFI/BOOT"
+        fi
+        fallback_file="${boot_dir}/${fallback_binary}"
+        _efi_info "Installing fallback loader: ${fallback_file}"
+        if [ "${EFI_DRY_RUN}" != "1" ]; then
+            mkdir -p "$boot_dir" 2>/dev/null || {
+                _efi_err "Cannot create directory: ${boot_dir}"
+                errors=$((errors + 1))
+            }
+        fi
+        if [ "$errors" -eq 0 ]; then
+            efi_safe_copy "${EFI_LOADER_SRC}" "$fallback_file" || errors=$((errors + 1))
+            [ "${_efi_copy_wrote:-0}" = "1" ] && updated=$((updated + 1))
+        fi
+    fi
+
+    # ── 3.  NVRAM entry ────────────────────────────────────────────────────────
+    efi_ensure_nvram_entry "$esp_mount" "$freebsd_loader"
+
+    # ── Summary ────────────────────────────────────────────────────────────────
+    [ "$updated" -gt 0 ] && \
+        _efi_info "Updated ${updated} EFI loader file(s) on /dev/${disk}p${part_index}"
+    [ "$errors" -gt 0 ] && {
+        _efi_warn "${errors} error(s) updating ESP on /dev/${disk}p${part_index}"
+        return 1
+    }
+    return 0
+}
+
+# ============================================================
+# BIOS BOOTCODE
+# ============================================================
+
+# Write BIOS-mode GPT bootcode to a freebsd-boot partition.
+# Selects gptzfsboot or gptboot based on the root filesystem type.
+efi_update_bios_bootcode() {
+    local disk="$1"
+    local part_index="$2"
+
+    local root_fs bootprog
+    root_fs=$(efi_root_fs_type)
+
+    case "$root_fs" in
+        zfs) bootprog="${EFI_BIOS_ZFS_BOOT}" ;;
+        ufs) bootprog="${EFI_BIOS_UFS_BOOT}" ;;
+        *)
+            _efi_warn "Unknown root FS '${root_fs}' on ${disk} — skipping BIOS bootcode"
+            return 0
+            ;;
+    esac
+
+    for f in "${EFI_BIOS_PMBR}" "$bootprog"; do
+        [ -f "$f" ] || {
+            _efi_warn "BIOS boot file not found: ${f}"
+            return 1
+        }
+    done
+
+    _efi_info "Updating BIOS bootcode on ${disk}p${part_index} (${root_fs})"
+    if [ "${EFI_DRY_RUN}" = "1" ]; then
+        _efi_info "[DRY RUN] gpart bootcode -b ${EFI_BIOS_PMBR} -p ${bootprog} -i ${part_index} ${disk}"
+        return 0
+    fi
+
+    gpart bootcode -b "${EFI_BIOS_PMBR}" \
+                   -p "$bootprog" \
+                   -i "$part_index" \
+                   "$disk" 2>/dev/null || {
+        _efi_err "gpart bootcode failed on ${disk}p${part_index}"
+        return 1
+    }
+
+    _efi_info "BIOS bootcode updated on ${disk}p${part_index}"
+}
+
+# ============================================================
+# MAIN ORCHESTRATION
+# ============================================================
+
+# Update all bootloaders on all boot disks.
+# Returns 0 if all updates succeeded, 1 if any failed.
+update_bootloaders() {
+    local total_errors=0
+
+    # ── Prerequisites ──────────────────────────────────────────────────────────
+    local rc
+    efi_check_prerequisites; rc=$?
+    case $rc in
+        0) ;;          # all good
+        2) return 0 ;; # in jail — skip silently
+        *) return 1 ;; # fatal
+    esac
+
+    # ── Boot method and architecture ───────────────────────────────────────────
+    local boot_method fallback_binary=""
+    boot_method=$(efi_boot_method)
+    _efi_info "Boot method detected: ${boot_method}"
+
+    if [ "$boot_method" = "UEFI" ]; then
+        fallback_binary=$(efi_fallback_binary) || {
+            _efi_warn "Cannot determine EFI binary name — EFI partition update skipped"
+            # Continue: BIOS bootcode on freebsd-boot partitions can still be updated.
+        }
+    fi
+
+    # ── Discover boot disks ────────────────────────────────────────────────────
+    local disks
+    if ! disks=$(efi_discover_boot_disks); then
+        _efi_warn "Boot disk discovery failed"
+        _efi_warn "If using hardware RAID or an exotic topology, update the bootloader manually"
+        return 0   # Non-fatal: warn and let the user continue
+    fi
+
+    _efi_info "Boot disk(s): $(printf '%s' "$disks" | tr '\n' ' ')"
+
+    # Register cleanup so temp mounts are removed even on error or signal.
+    trap 'efi_cleanup_mounts' EXIT INT TERM
+
+    # ── Per-disk processing ────────────────────────────────────────────────────
+    local disk
+    for disk in $disks; do
+        _efi_verb "--- Processing disk: ${disk} ---"
+
+        # ── EFI System Partition ───────────────────────────────────────────────
+        if [ "$boot_method" = "UEFI" ] && [ -n "$fallback_binary" ]; then
+            local efi_parts
+            efi_parts=$(efi_efi_partitions "$disk")
+
+            if [ -z "$efi_parts" ]; then
+                _efi_verb "No EFI partition on ${disk}"
+            else
+                local pidx
+                for pidx in $efi_parts; do
+                    _efi_info "Processing EFI partition: ${disk}p${pidx}"
+
+                    if ! efi_mount_esp "$disk" "$pidx"; then
+                        _efi_err "Skipping ${disk}p${pidx} — mount failed"
+                        total_errors=$((total_errors + 1))
+                        continue
+                    fi
+
+                    local esp_mp="${_efi_esp_mp}"
+
+                    if ! efi_check_space "$esp_mp"; then
+                        total_errors=$((total_errors + 1))
+                        efi_unmount_esp
+                        continue
+                    fi
+
+                    efi_update_esp "$esp_mp" "$fallback_binary" "$disk" "$pidx" || \
+                        total_errors=$((total_errors + 1))
+
+                    efi_unmount_esp
+                done
+            fi
+        fi
+
+        # ── BIOS freebsd-boot partition ────────────────────────────────────────
+        local bios_parts
+        bios_parts=$(efi_bios_partitions "$disk")
+        if [ -n "$bios_parts" ]; then
+            local bidx
+            for bidx in $bios_parts; do
+                efi_update_bios_bootcode "$disk" "$bidx" || \
+                    total_errors=$((total_errors + 1))
+            done
+        fi
+    done
+
+    # ── Final status ───────────────────────────────────────────────────────────
+    if [ "$total_errors" -gt 0 ]; then
+        _efi_warn "Bootloader update finished with ${total_errors} error(s)"
+        _efi_warn "Review the messages above and update any failed bootloaders manually"
+        return 1
+    fi
+
+    if [ "${EFI_DRY_RUN}" = "1" ]; then
+        _efi_info "[DRY RUN] Bootloader update complete (no changes made)"
+    else
+        _efi_info "Bootloader update complete"
+    fi
+    return 0
+}
+
+# ============================================================
+# STANDALONE ENTRY POINT
+# ============================================================
+
+# When executed directly (not sourced), parse arguments and run.
+_efi_script_name="${0##*/}"
+if [ "${_efi_script_name}" = "efi_bootloader_update.sh" ]; then
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run|-n) EFI_DRY_RUN=1  ;;
+            --verbose|-v) EFI_VERBOSE=1  ;;
+            --help|-h)
+                cat <<EOF
+Usage: ${_efi_script_name} [OPTIONS]
+
+Updates the FreeBSD EFI bootloader on the EFI System Partition(s) and the
+BIOS bootcode on freebsd-boot partition(s) for all disks participating in
+the root filesystem.
+
+Options:
+  -n, --dry-run   Show what would be done without making any changes
+  -v, --verbose   Enable debug/verbose output
+  -h, --help      Show this help message
+
+Environment:
+  EFI_LOADER_SRC      Source loader path (default: /boot/loader.efi)
+  EFI_DRY_RUN         1 = dry-run mode
+  EFI_VERBOSE         1 = verbose/debug mode
+EOF
+                exit 0
+                ;;
+            *)
+                echo "${_efi_script_name}: unknown option: $1" >&2
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    update_bootloaders
+    exit $?
+fi

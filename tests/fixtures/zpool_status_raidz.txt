@@ -1,0 +1,12 @@
+  pool: zroot
+ state: ONLINE
+config:
+
+	NAME          STATE     READ WRITE CKSUM
+	zroot         ONLINE       0     0     0
+	  raidz1-0    ONLINE       0     0     0
+	    ada0p3    ONLINE       0     0     0
+	    ada1p3    ONLINE       0     0     0
+	    ada2p3    ONLINE       0     0     0
+
+errors: No known data errors

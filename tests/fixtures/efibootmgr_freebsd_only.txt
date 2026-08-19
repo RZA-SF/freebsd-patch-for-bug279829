@@ -1,0 +1,6 @@
+Boot to FW : false
+BootCurrent: 0001
+Timeout    : 1 seconds
+BootOrder  : 0001
++Boot0001* FreeBSD HD(1,GPT,228044d9-1bc1-11eb-924d-1c697a6048c3,0x28,0x64000)/File(\EFI\FreeBSD\loader.efi)
+                   nda0p1:/EFI/FreeBSD/loader.efi (null)

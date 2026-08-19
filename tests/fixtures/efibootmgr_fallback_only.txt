@@ -1,0 +1,6 @@
+Boot to FW : false
+BootCurrent: 0001
+Timeout    : 1 seconds
+BootOrder  : 0001
++Boot0001* boot HD(1,GPT,228044d9-1bc1-11eb-924d-1c697a6048c3,0x28,0x64000)/File(\EFI\boot\bootx64.efi)
+                   nda0p1:/EFI/boot/bootx64.efi (null)

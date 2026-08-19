@@ -1,0 +1,3 @@
+zroot/ROOT/default on / (zfs, local, noatime, nfsv4acls)
+devfs on /dev (devfs)
+/dev/nda0p1 on /boot/efi (msdosfs, local)

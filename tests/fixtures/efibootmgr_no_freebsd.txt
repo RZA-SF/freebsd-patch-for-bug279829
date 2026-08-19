@@ -1,0 +1,5 @@
+Boot to FW : false
+BootCurrent: 0001
+Timeout    : 1 seconds
+BootOrder  : 0001, 0000
++Boot0001* Windows Boot Manager HD(1,GPT,8046efd4-c078-4da5-a3d0-24c3888f52d2,0x800,0x32000)/File(\EFI\Microsoft\Boot\bootmgfw.efi)
