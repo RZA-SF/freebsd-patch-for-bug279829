@@ -38,7 +38,7 @@ users who never cross a major version boundary also receive the fix.
 
 There is a subtle bootstrapping concern: the first upgrade on any branch that
 *includes* this script will run it.  For upgrades *prior* to its inclusion,
-the old (missing) behaviour applies.  Once the script is in the distribution,
+the old (missing) behavior applies.  Once the script is in the distribution,
 all subsequent upgrades on that branch will update the ESP correctly.
 
 This means backporting to older branches only helps users who have not yet

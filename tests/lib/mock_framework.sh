@@ -92,8 +92,10 @@ mock_was_called() {
 # mock_call_count NAME: Outputs the number of times NAME was called
 mock_call_count() {
     _mock_name="$1"
-    _mock_count=$(grep -c "^${_mock_name} \|^${_mock_name}$" "${MOCK_CALL_LOG}" 2>/dev/null || echo 0)
-    echo "${_mock_count}"
+    # grep -c exits 1 when there are no matches (count=0) while still printing
+    # "0".  Use || true so the exit status does not suppress the output.
+    _mock_count=$(grep -c "^${_mock_name} \|^${_mock_name}$" "${MOCK_CALL_LOG}" 2>/dev/null) || true
+    echo "${_mock_count:-0}"
     unset _mock_name _mock_count
 }
 

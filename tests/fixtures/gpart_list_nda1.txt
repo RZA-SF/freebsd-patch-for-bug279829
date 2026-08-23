@@ -1,0 +1,48 @@
+Geom name: nda1
+modified: false
+state: OK
+entries: 4
+first: 40
+last: 976773134
+sector: 512
+4 consumers
+1. Name: nda1p1
+   Mediasize: 209715200 (200M)
+   Sectorsize: 512
+   rawuuid: bbbbcccc-2222-3333-4444-555566667777
+   rawtype: c12a7328-f81f-11d2-ba4b-00a0c93ec93b
+   label: (null)
+   type: efi
+   index: 1
+   start: 2048
+   end: 411647
+2. Name: nda1p2
+   Mediasize: 524288 (512K)
+   Sectorsize: 512
+   rawuuid: ddddeeee-6666-7777-8888-999900001111
+   rawtype: 83bd6b9d-7f41-11dc-be0b-001560b84f0f
+   label: (null)
+   type: freebsd-boot
+   index: 2
+   start: 411648
+   end: 412671
+3. Name: nda1p3
+   Mediasize: 8589934592 (8.0G)
+   Sectorsize: 512
+   rawuuid: ffffaaaa-bbbb-cccc-dddd-eeee00001111
+   rawtype: 516e7cba-6ecf-11d6-8ff8-00022d09712b
+   label: (null)
+   type: freebsd-swap
+   index: 3
+   start: 412672
+   end: 17188863
+4. Name: nda1p4
+   Mediasize: 490717286912 (457G)
+   Sectorsize: 512
+   rawuuid: 33334444-5555-6666-7777-888899990000
+   rawtype: 516e7cba-6ecf-11d6-8ff8-00022d09712b
+   label: (null)
+   type: freebsd-zfs
+   index: 4
+   start: 17188864
+   end: 976773134

@@ -1,5 +1,11 @@
+# Debug output from real hardware test runs
+debug/
+
 # Session transcripts saved locally
 session_*.txt
+
+# Local review/response planning notes — not part of the patch submission
+reviews.md
 
 # VS Code workspace file (local dev preference, not project config)
 *.code-workspace

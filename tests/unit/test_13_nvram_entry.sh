@@ -2,9 +2,13 @@
 # test_13_nvram_entry.sh - Tests for efi_ensure_nvram_entry
 #
 # Verifies that efi_ensure_nvram_entry handles the absence of efibootmgr
-# gracefully, skips creating an entry when one already exists, creates a new
-# entry when none exists, handles efibootmgr failures non-fatally, and
-# respects dry-run mode.
+# gracefully, skips when EFIRT (/dev/efi) is unavailable, skips creating an
+# entry when one already exists, creates a new entry when none exists, handles
+# efibootmgr failures non-fatally, and respects dry-run mode.
+#
+# _EFI_DEV_EFI is set to /dev/null (a character device present on all hosts)
+# to simulate EFIRT being available.  Tests that specifically verify the
+# EFIRT-absent path leave _EFI_DEV_EFI unset or point it to a non-existent path.
 #
 # Note: after removing or (re-)creating the efibootmgr mock, `hash -r` is
 # called to clear the POSIX sh command hash table.  Without this, dash caches
@@ -34,7 +38,11 @@ export EFI_LOADER_SRC
 _ESP_MOUNT="/tmp/esp_test"
 _LOADER_ABS="${_ESP_MOUNT}/EFI/FreeBSD/loader.efi"
 
-tap_begin 6
+tap_begin 8
+
+# Simulate EFIRT available for all tests except the EFIRT-absent test.
+_EFI_DEV_EFI=/dev/null
+export _EFI_DEV_EFI
 
 # Test 1: efibootmgr not available -> returns 0 (non-fatal)
 # Remove efibootmgr from MOCK_BIN so `command -v efibootmgr` fails.
@@ -113,6 +121,21 @@ _create_args="$(mock_last_args efibootmgr)"
 assert_contains \
     "efibootmgr -l: Unix path passed (not EFI backslash path)" \
     "${_create_args}" "${_LOADER_ABS}"
+
+# Test 7: EFIRT (/dev/efi) unavailable -> returns 0, efibootmgr not called
+# Point _EFI_DEV_EFI at a path that does not exist so the character-device
+# check fails, simulating a kernel without options EFIRT.
+mock_cmd efibootmgr "cat \"${FIXTURES_DIR}/efibootmgr_no_freebsd.txt\""
+hash -r 2>/dev/null || true
+: > "${MOCK_CALL_LOG}"
+_EFI_DEV_EFI=/nonexistent/dev/efi
+_rc=0
+efi_ensure_nvram_entry "${_ESP_MOUNT}" "${_LOADER_ABS}" 2>/dev/null || _rc=$?
+assert_eq "EFIRT absent -> returns 0 (non-fatal)" "${_rc}" "0"
+_count="$(mock_call_count efibootmgr)"
+assert_eq "EFIRT absent -> efibootmgr not called" "${_count}" "0"
+# Restore for any subsequent tests
+_EFI_DEV_EFI=/dev/null
 
 tap_end
 

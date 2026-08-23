@@ -14,7 +14,7 @@ sources two libraries from `tests/lib/`:
 - `mock_framework.sh` — PATH-injection mock framework (`mock_init`,
   `mock_cmd`, `mock_was_called`, `mock_call_count`, etc.)
 
-Tests are organised into three suites:
+Tests are organized into three suites:
 
 | Suite | Directory | Purpose |
 |---|---|---|
@@ -275,7 +275,7 @@ prove -s tests/integration/test_*.sh
 prove -vs tests/unit/test_*.sh
 ```
 
-`prove` provides coloured output, timing information, and a concise summary.
+`prove` provides colored output, timing information, and a concise summary.
 
 ---
 

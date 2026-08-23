@@ -37,26 +37,15 @@ mock_cmd sysctl '
 case "$*" in
     *security.jail.jailed*) echo "0" ;;
     *machdep.bootmethod*)   echo "UEFI" ;;
+    *kern.disks*)           echo "nda0" ;;
     *) echo "0" ;;
 esac'
 
 mock_cmd_output uname "amd64"
 
-# mount: show /dev/nda0p1 already mounted at our EXISTING_MP
-mock_cmd mount "
-case \"\$*\" in
-    *msdosfs*)
-        # Should NOT be called — ESP already mounted
-        echo 'mount_msdosfs called unexpectedly' >&2
-        exit 1
-        ;;
-    *)
-        # Show current mounts — ESP is already mounted
-        printf '/dev/nda0p1 on ${EXISTING_MP} (msdosfs, local)\n'
-        printf 'zroot on / type zfs (local)\n'
-        ;;
-esac"
-
+# mount --libxo json: show /dev/nda0p1 already mounted at our EXISTING_MP
+# Uses double quotes so ${EXISTING_MP} expands at mock-definition time.
+mock_cmd mount "printf '{\"mount\":{\"mounted\":[{\"special\":\"/dev/nda0p1\",\"node\":\"${EXISTING_MP}\",\"fstype\":\"msdosfs\",\"opts\":[\"rw\"]},{\"special\":\"zroot/ROOT/default\",\"node\":\"/\",\"fstype\":\"zfs\",\"opts\":[\"rw\",\"noatime\"]}]}}\n'"
 mock_cmd_output zfs "zroot"
 mock_cmd zpool '
 cat <<ZPS

@@ -79,16 +79,13 @@ mock_cmd sysctl '
 case "$*" in
     *security.jail.jailed*) echo "0" ;;
     *machdep.bootmethod*)   echo "UEFI" ;;
+    *kern.disks*)           echo "da0 da1" ;;
     *) echo "0" ;;
 esac'
 mock_cmd_output uname "amd64"
 
 # --- Mock: mount ---
-mock_cmd mount '
-case "$*" in
-    *msdosfs*) exit 0 ;;
-    *) printf "zroot on / type zfs (local)\n" ;;
-esac'
+mock_cmd mount 'printf "{\"mount\":{\"mounted\":[{\"special\":\"zroot/ROOT/default\",\"node\":\"/\",\"fstype\":\"zfs\",\"opts\":[\"rw\",\"noatime\"]}]}}\n"'
 
 # --- Mock: zfs ---
 mock_cmd_output zfs "zroot"
@@ -155,6 +152,9 @@ mock_cmd stat 'echo "512"'
 # --- Source script ---
 unset _EFI_BOOTLOADER_UPDATE_SH
 . "${SRC_DIR}/efi_bootloader_update.sh"
+# Simulate EFIRT present on Linux (where /dev/efi does not exist)
+_EFI_DEV_EFI=/dev/null
+export _EFI_DEV_EFI
 
 # --- Run ---
 update_bootloaders

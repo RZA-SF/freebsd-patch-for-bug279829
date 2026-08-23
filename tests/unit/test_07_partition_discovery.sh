@@ -1,9 +1,10 @@
 #!/bin/sh
-# test_07_partition_discovery.sh - Tests for efi_efi_partitions and efi_bios_partitions
+# test_07_partition_discovery.sh - Partition type detection via efi_discover_all_esps
 #
-# Verifies that the correct partition indices are returned when gpart output
-# contains efi and/or freebsd-boot entries, and that an empty result is
-# returned when neither type is present or when gpart fails.
+# Verifies that GPT and MBR partition types are correctly identified and that
+# the output scheme field is set appropriately.  Edge cases include labelled
+# GPT partitions (where gpart show inserts a [label] field) and disks with
+# only BIOS or no boot partitions.
 
 TESTS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "${TESTS_DIR}/lib/test_helpers.sh"
@@ -15,7 +16,6 @@ FIXTURES_DIR="${TESTS_DIR}/fixtures"
 mock_init
 
 mock_cmd_output id "0"
-mock_cmd_output sysctl "0"
 
 _dummy_loader="$(mktemp)"
 printf 'dummy' > "${_dummy_loader}"
@@ -24,47 +24,62 @@ export EFI_LOADER_SRC
 
 . "${SRC_DIR}/efi_bootloader_update.sh"
 
-tap_begin 8
+tap_begin 9
 
-# Test 1: disk with efi + freebsd-boot -> efi_efi_partitions returns "1"
+# Test 1: GPT disk, efi partition at index 1 -> "nda0 1 GPT"
+mock_cmd sysctl 'case "$*" in *kern.disks*) echo "nda0" ;; *) echo "0" ;; esac'
 mock_cmd gpart "cat \"${FIXTURES_DIR}/gpart_show_single_efi_bios.txt\""
-_result="$(efi_efi_partitions nda0 2>/dev/null)"
-assert_eq "efi+bios disk: efi_efi_partitions returns 1" "${_result}" "1"
+_result="$(efi_discover_all_esps 2>/dev/null)"
+assert_eq "GPT efi at index 1 -> nda0 1 GPT" "${_result}" "nda0 1 GPT"
 
-# Test 2: disk with efi + freebsd-boot -> efi_bios_partitions returns "2"
-mock_cmd gpart "cat \"${FIXTURES_DIR}/gpart_show_single_efi_bios.txt\""
-_result="$(efi_bios_partitions nda0 2>/dev/null)"
-assert_eq "efi+bios disk: efi_bios_partitions returns 2" "${_result}" "2"
-
-# Test 3: disk with only efi -> efi_efi_partitions returns "1"
+# Test 2: GPT disk, efi partition only (no freebsd-boot) -> still found
+mock_cmd sysctl 'case "$*" in *kern.disks*) echo "nvd0" ;; *) echo "0" ;; esac'
 mock_cmd gpart "cat \"${FIXTURES_DIR}/gpart_show_single_efi_only.txt\""
-_result="$(efi_efi_partitions nvd0 2>/dev/null)"
-assert_eq "efi-only disk: efi_efi_partitions returns 1" "${_result}" "1"
+_result="$(efi_discover_all_esps 2>/dev/null)"
+assert_eq "GPT efi-only disk -> nvd0 1 GPT" "${_result}" "nvd0 1 GPT"
 
-# Test 4: disk with only efi -> efi_bios_partitions returns empty
-mock_cmd gpart "cat \"${FIXTURES_DIR}/gpart_show_single_efi_only.txt\""
-_result="$(efi_bios_partitions nvd0 2>/dev/null)"
-assert_empty "efi-only disk: efi_bios_partitions returns empty" "${_result}"
+# Test 3: GPT with labelled partitions -> [label] annotation does not break awk
+mock_cmd sysctl 'case "$*" in *kern.disks*) echo "nvd0" ;; *) echo "0" ;; esac'
+mock_cmd gpart "cat \"${FIXTURES_DIR}/gpart_show_gpt_labelled.txt\""
+_result="$(efi_discover_all_esps 2>/dev/null)"
+assert_eq "GPT labelled: [efi0] label does not break field parsing" "${_result}" "nvd0 1 GPT"
 
-# Test 5: disk with no efi (MBR layout) -> efi_efi_partitions returns empty
+# Test 4: MBR disk with !12 (FAT32 LBA) -> "mmcsd0 1 MBR"
+mock_cmd sysctl 'case "$*" in *kern.disks*) echo "mmcsd0" ;; *) echo "0" ;; esac'
+mock_cmd gpart "cat \"${FIXTURES_DIR}/gpart_show_mbr_fat32lba.txt\""
+_result="$(efi_discover_all_esps 2>/dev/null)"
+assert_eq "MBR !12 partition -> mmcsd0 1 MBR" "${_result}" "mmcsd0 1 MBR"
+
+# Test 5: MBR disk with !ef (EFI System type) -> "ada0 1 MBR"
+mock_cmd sysctl 'case "$*" in *kern.disks*) echo "ada0" ;; *) echo "0" ;; esac'
+mock_cmd gpart "cat \"${FIXTURES_DIR}/gpart_show_mbr_efi_type.txt\""
+_result="$(efi_discover_all_esps 2>/dev/null)"
+assert_eq "MBR !ef partition -> ada0 1 MBR" "${_result}" "ada0 1 MBR"
+
+# Test 6: MBR disk with no EFI-typed partition -> empty (freebsd type not an ESP)
+mock_cmd sysctl 'case "$*" in *kern.disks*) echo "ada0" ;; *) echo "0" ;; esac'
 mock_cmd gpart "cat \"${FIXTURES_DIR}/gpart_show_no_efi.txt\""
-_result="$(efi_efi_partitions ada0 2>/dev/null)"
-assert_empty "no-efi disk: efi_efi_partitions returns empty" "${_result}"
+_result="$(efi_discover_all_esps 2>/dev/null)"
+assert_empty "MBR disk without !12/!ef partition -> empty" "${_result}"
 
-# Test 6: disk with no efi (MBR layout) -> efi_bios_partitions returns empty
-mock_cmd gpart "cat \"${FIXTURES_DIR}/gpart_show_no_efi.txt\""
-_result="$(efi_bios_partitions ada0 2>/dev/null)"
-assert_empty "no-efi disk: efi_bios_partitions returns empty" "${_result}"
+# Test 7: GPT disk with only freebsd-boot (no efi partition) -> empty
+mock_cmd sysctl 'case "$*" in *kern.disks*) echo "nda0" ;; *) echo "0" ;; esac'
+mock_cmd gpart 'printf "=>      40  976773168  nda0  GPT  (466G)\n    409640  976363528     1  freebsd-boot  (512K)\n    410152  976363376     2  freebsd-zfs  (466G)\n"'
+_result="$(efi_discover_all_esps 2>/dev/null)"
+assert_empty "GPT freebsd-boot only (no efi) -> empty" "${_result}"
 
-# Test 7: gpart fails -> efi_efi_partitions returns empty
+# Test 8: gpart show fails -> disk skipped, function returns 1
+mock_cmd sysctl 'case "$*" in *kern.disks*) echo "ada0" ;; *) echo "0" ;; esac'
 mock_cmd_fail gpart 1
-_result="$(efi_efi_partitions ada0 2>/dev/null)"
-assert_empty "gpart fails: efi_efi_partitions returns empty" "${_result}"
+_rc=0
+efi_discover_all_esps 2>/dev/null || _rc=$?
+assert_ne "gpart fails on all disks -> returns non-zero" "${_rc}" "0"
 
-# Test 8: gpart fails -> efi_bios_partitions returns empty
-mock_cmd_fail gpart 1
-_result="$(efi_bios_partitions ada0 2>/dev/null)"
-assert_empty "gpart fails: efi_bios_partitions returns empty" "${_result}"
+# Test 9: kern.disks fails -> function returns non-zero
+mock_cmd sysctl 'case "$*" in *kern.disks*) exit 1 ;; *) echo "0" ;; esac'
+_rc=0
+efi_discover_all_esps 2>/dev/null || _rc=$?
+assert_ne "kern.disks fails -> returns non-zero" "${_rc}" "0"
 
 tap_end
 

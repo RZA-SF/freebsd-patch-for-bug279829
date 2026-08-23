@@ -3,7 +3,10 @@
 #
 # Verifies the FreeBSD loader fingerprinting logic.  The function calls the
 # real `strings` binary on actual temp files written for each test case,
-# so no mocking of strings is needed.  The threshold is 2 of 3 markers.
+# so no mocking of strings is needed.
+#
+# Primary check: bootprog_info pattern "FreeBSD/<arch> EFI," (since FreeBSD 11).
+# Fallback: 2-of-3 heuristic ("FreeBSD", "loader.efi", "boot/lua").
 
 TESTS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "${TESTS_DIR}/lib/test_helpers.sh"
@@ -24,7 +27,7 @@ export EFI_LOADER_SRC
 
 _tmpdir="$(mktemp -d)"
 
-tap_begin 6
+tap_begin 8
 
 # Test 1: all three markers present -> returns 0 (is FreeBSD loader)
 _f1="${_tmpdir}/all_three.bin"
@@ -54,6 +57,23 @@ assert_false "empty file -> returns 1" efi_is_freebsd_loader "${_f5}"
 # Test 6: non-existent file -> returns 1
 assert_false "non-existent file -> returns 1" \
     efi_is_freebsd_loader "${_tmpdir}/does_not_exist.bin"
+
+# ── bootprog_info primary check ───────────────────────────────────────────────
+
+# Test 7: bootprog_info string present -> returns 0 via primary check.
+# newvers.sh embeds "FreeBSD/<arch> EFI, Revision N.N" in all loaders since
+# FreeBSD 11.  This must match even without the heuristic markers.
+_f7="${_tmpdir}/bootprog_info.bin"
+printf 'FreeBSD/amd64 EFI, Revision 1.1\0some_other_content\n' > "${_f7}"
+assert_true "bootprog_info 'FreeBSD/amd64 EFI,' -> returns 0" \
+    efi_is_freebsd_loader "${_f7}"
+
+# Test 8: bootprog_info matches arm64 variant -> returns 0.
+# Pattern must cover all architectures, not just amd64.
+_f8="${_tmpdir}/bootprog_info_arm64.bin"
+printf 'FreeBSD/arm64 EFI, Revision 1.1\0unrelated\n' > "${_f8}"
+assert_true "bootprog_info 'FreeBSD/arm64 EFI,' -> returns 0" \
+    efi_is_freebsd_loader "${_f8}"
 
 tap_end
 

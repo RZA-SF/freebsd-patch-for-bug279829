@@ -48,24 +48,15 @@ mock_cmd sysctl '
 case "$*" in
     *security.jail.jailed*) echo "0" ;;
     *machdep.bootmethod*)   echo "UEFI" ;;
+    *kern.disks*)           echo "nda0" ;;
     *) echo "0" ;;
 esac'
 
 # --- Mock: uname returns amd64 ---
 mock_cmd_output uname "amd64"
 
-# --- Mock: mount (root is zfs, ESP not yet mounted) ---
-mock_cmd mount '
-case "$*" in
-    *msdosfs*)
-        # Actual mount call - succeed silently
-        exit 0
-        ;;
-    *)
-        # mount with no args: show current mounts
-        printf "zroot on / type zfs (local)\n"
-        ;;
-esac'
+# --- Mock: mount --libxo json: ZFS root, ESP not mounted ---
+mock_cmd mount 'printf "{\"mount\":{\"mounted\":[{\"special\":\"zroot/ROOT/default\",\"node\":\"/\",\"fstype\":\"zfs\",\"opts\":[\"rw\",\"noatime\"]}]}}\n"'
 
 # --- Mock: zfs returns pool name "zroot" ---
 mock_cmd_output zfs "zroot"
@@ -142,6 +133,9 @@ mock_cmd stat 'echo "512"'
 # --- Source the script under test (guard prevents double-source issues) ---
 unset _EFI_BOOTLOADER_UPDATE_SH
 . "${SRC_DIR}/efi_bootloader_update.sh"
+# Simulate EFIRT present on Linux (where /dev/efi does not exist)
+_EFI_DEV_EFI=/dev/null
+export _EFI_DEV_EFI
 
 # --- Run ---
 update_bootloaders

@@ -1,0 +1,1 @@
+{"mount":{"mounted":[{"special":"/dev/ada0p2","node":"/","fstype":"ufs","opts":["local","soft-updates"]},{"special":"devfs","node":"/dev","fstype":"devfs","opts":["multilabel"]}]}}

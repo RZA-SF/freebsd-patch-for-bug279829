@@ -43,15 +43,26 @@ assert_eq "normal copy -> dst content matches src" "${_actual}" "${_expected}"
 assert_false "temp file .new does not remain after copy" test -f "${_dst}.new"
 
 # Test 4: dst directory is read-only -> returns 1
+# FreeBSD (the target platform) runs this test as root, and root bypasses
+# chmod-based permission checks.  Use chflags schg (system-immutable) when
+# available — even root cannot create files in a schg directory without first
+# clearing the flag.  Fall back to chmod 555 on systems without chflags.
 _rodir="${_tmpdir}/ro"
 mkdir -p "${_rodir}"
 _ro_dst="${_rodir}/loader.efi"
-# Make the directory read-only so cp cannot create the temp file there.
-chmod 555 "${_rodir}"
-_rc=0
-efi_safe_copy "${_src}" "${_ro_dst}" 2>/dev/null || _rc=$?
-assert_ne "read-only dst dir -> returns non-zero" "${_rc}" "0"
-chmod 755 "${_rodir}"
+if command -v chflags >/dev/null 2>&1; then
+    chflags schg "${_rodir}"
+    _rc=0
+    efi_safe_copy "${_src}" "${_ro_dst}" 2>/dev/null || _rc=$?
+    assert_ne "read-only dst dir -> returns non-zero" "${_rc}" "0"
+    chflags noschg "${_rodir}"
+else
+    chmod 555 "${_rodir}"
+    _rc=0
+    efi_safe_copy "${_src}" "${_ro_dst}" 2>/dev/null || _rc=$?
+    assert_ne "read-only dst dir -> returns non-zero" "${_rc}" "0"
+    chmod 755 "${_rodir}"
+fi
 
 # Test 5: src does not exist -> returns 1
 _rc=0

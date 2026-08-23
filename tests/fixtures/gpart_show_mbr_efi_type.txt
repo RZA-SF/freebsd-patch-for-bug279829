@@ -1,0 +1,5 @@
+=>       63   2097088  ada0  MBR  (1.0G)
+         63    204800       1  !ef  (100M)
+     204863   1892288       2  !83  (924M)
+
+errors: No known data errors

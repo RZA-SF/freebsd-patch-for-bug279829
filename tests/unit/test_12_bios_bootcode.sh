@@ -10,6 +10,8 @@ TESTS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "${TESTS_DIR}/lib/mock_framework.sh"
 SRC_DIR="$(cd "${TESTS_DIR}/../src" && pwd)"
 
+FIXTURES_DIR="${TESTS_DIR}/fixtures"
+
 mock_init
 
 mock_cmd_output id "0"
@@ -39,9 +41,7 @@ export EFI_BIOS_PMBR EFI_BIOS_ZFS_BOOT EFI_BIOS_UFS_BOOT
 tap_begin 8
 
 # Test 1: ZFS root -> gpart called with gptzfsboot
-# Use Linux-style mount format: device on mountpoint type fstype (options)
-# efi_root_fs_type uses: awk '$3 == "/" { print $5; exit }'
-mock_cmd mount 'printf "zroot/ROOT/default on / type zfs (rw,relatime)\n"'
+mock_cmd mount "cat \"${FIXTURES_DIR}/mount_libxo_zfs.json\""
 mock_cmd_output gpart ""
 EFI_DRY_RUN=0
 efi_update_bios_bootcode nda0 2 2>/dev/null
@@ -53,7 +53,7 @@ assert_contains "ZFS root -> gpart args include gptzfsboot" \
 # Test 2: UFS root -> gpart called with gptboot
 # Reset call log between tests.
 : > "${MOCK_CALL_LOG}"
-mock_cmd mount 'printf "/dev/ada0p2 on / type ufs (rw,noatime)\n"'
+mock_cmd mount "cat \"${FIXTURES_DIR}/mount_libxo_ufs.json\""
 mock_cmd_output gpart ""
 EFI_DRY_RUN=0
 efi_update_bios_bootcode ada0 2 2>/dev/null
@@ -63,7 +63,7 @@ assert_contains "UFS root -> gpart args include gptboot" \
 
 # Test 3: unknown FS type -> returns 0 (skip with warning, no gpart call)
 : > "${MOCK_CALL_LOG}"
-mock_cmd mount 'printf "tmpfs on / type tmpfs (rw,size=512m)\n"'
+mock_cmd mount 'printf "{\"mount\":{\"mounted\":[{\"special\":\"tmpfs\",\"node\":\"/\",\"fstype\":\"tmpfs\",\"options\":\"rw,size=512m\"}]}}\n"'
 mock_cmd_output gpart ""
 EFI_DRY_RUN=0
 _rc=0
@@ -72,7 +72,7 @@ assert_eq "unknown FS type -> returns 0" "${_rc}" "0"
 
 # Test 4: pmbr file missing -> returns 1
 : > "${MOCK_CALL_LOG}"
-mock_cmd mount 'printf "zroot/ROOT/default on / type zfs (rw,relatime)\n"'
+mock_cmd mount "cat \"${FIXTURES_DIR}/mount_libxo_zfs.json\""
 _saved_pmbr="${EFI_BIOS_PMBR}"
 EFI_BIOS_PMBR="${_tmpdir}/no_such_pmbr"
 _rc=0
@@ -82,7 +82,7 @@ EFI_BIOS_PMBR="${_saved_pmbr}"
 
 # Test 5: bootprog file missing -> returns 1
 : > "${MOCK_CALL_LOG}"
-mock_cmd mount 'printf "zroot/ROOT/default on / type zfs (rw,relatime)\n"'
+mock_cmd mount "cat \"${FIXTURES_DIR}/mount_libxo_zfs.json\""
 _saved_zfsboot="${EFI_BIOS_ZFS_BOOT}"
 EFI_BIOS_ZFS_BOOT="${_tmpdir}/no_such_gptzfsboot"
 _rc=0
@@ -92,7 +92,7 @@ EFI_BIOS_ZFS_BOOT="${_saved_zfsboot}"
 
 # Test 6: gpart fails -> returns 1
 : > "${MOCK_CALL_LOG}"
-mock_cmd mount 'printf "zroot/ROOT/default on / type zfs (rw,relatime)\n"'
+mock_cmd mount "cat \"${FIXTURES_DIR}/mount_libxo_zfs.json\""
 mock_cmd_fail gpart 1
 _rc=0
 efi_update_bios_bootcode nda0 2 2>/dev/null || _rc=$?
@@ -100,7 +100,7 @@ assert_ne "gpart fails -> returns non-zero" "${_rc}" "0"
 
 # Test 7: dry-run mode -> gpart is NOT called
 : > "${MOCK_CALL_LOG}"
-mock_cmd mount 'printf "zroot/ROOT/default on / type zfs (rw,relatime)\n"'
+mock_cmd mount "cat \"${FIXTURES_DIR}/mount_libxo_zfs.json\""
 mock_cmd_output gpart ""
 EFI_DRY_RUN=1
 efi_update_bios_bootcode nda0 2 2>/dev/null
