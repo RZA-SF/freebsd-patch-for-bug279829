@@ -2,7 +2,8 @@
 # test_02_boot_method.sh - Tests for efi_boot_method
 #
 # Verifies that efi_boot_method correctly reads machdep.bootmethod from
-# sysctl and handles failure by returning "unknown".
+# sysctl, and falls back to "UEFI" when the OID is unavailable (e.g.
+# aarch64 platforms where machdep.bootmethod does not exist).
 
 TESTS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "${TESTS_DIR}/lib/test_helpers.sh"
@@ -23,7 +24,7 @@ mock_cmd_output id "0"
 
 . "${SRC_DIR}/efi_bootloader_update.sh"
 
-tap_begin 3
+tap_begin 4
 
 # Test 1: sysctl returns "UEFI"
 mock_cmd_output sysctl "UEFI"
@@ -35,10 +36,17 @@ mock_cmd_output sysctl "BIOS"
 assert_eq "sysctl returns BIOS -> function returns BIOS" \
     "$(efi_boot_method)" "BIOS"
 
-# Test 3: sysctl fails -> function returns "unknown"
+# Test 3: sysctl fails (OID absent, e.g. aarch64) -> function returns "UEFI"
+# Regression: previously returned "unknown", causing EFI update to be skipped
+# entirely on platforms like the Windows Dev Kit 2023 (aarch64).
 mock_cmd_fail sysctl 1
-assert_eq "sysctl fails -> function returns unknown" \
-    "$(efi_boot_method)" "unknown"
+assert_eq "sysctl fails (OID absent) -> function returns UEFI" \
+    "$(efi_boot_method 2>/dev/null)" "UEFI"
+
+# Test 4: sysctl exits 0 but returns empty string -> function returns "UEFI"
+mock_cmd_output sysctl ""
+assert_eq "sysctl returns empty string -> function returns UEFI" \
+    "$(efi_boot_method 2>/dev/null)" "UEFI"
 
 tap_end
 

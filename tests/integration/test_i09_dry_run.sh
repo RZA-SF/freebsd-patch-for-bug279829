@@ -59,16 +59,13 @@ mock_cmd sysctl '
 case "$*" in
     *security.jail.jailed*) echo "0" ;;
     *machdep.bootmethod*)   echo "UEFI" ;;
+    *kern.disks*)           echo "nda0" ;;
     *) echo "0" ;;
 esac'
 
 mock_cmd_output uname "amd64"
 
-mock_cmd mount '
-case "$*" in
-    *msdosfs*) exit 1 ;;
-    *) printf "zroot on / type zfs (local)\n" ;;
-esac'
+mock_cmd mount 'printf "{\"mount\":{\"mounted\":[{\"special\":\"zroot/ROOT/default\",\"node\":\"/\",\"fstype\":\"zfs\",\"opts\":[\"rw\",\"noatime\"]}]}}\n"'
 
 mock_cmd_output zfs "zroot"
 mock_cmd zpool '

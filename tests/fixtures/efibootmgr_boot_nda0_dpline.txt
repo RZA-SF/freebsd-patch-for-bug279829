@@ -1,0 +1,10 @@
+BootCurrent: 0004
+Timeout: 3 seconds
+BootOrder: 0004,0001,0000
+ Boot0000  Windows Boot Manager
+       dp: HD(1,GPT,99990000-1234-5678-abcd-ef0123456789,0x800,0x32000)/File(\EFI\MICROSOFT\BOOT\BOOTMGFW.EFI)
+ Boot0001  FreeBSD
+       dp: HD(1,GPT,aaaabbbb-1111-2222-3333-444455556666,0x800,0x64000)/File(\EFI\FreeBSD\loader.efi)
++Boot0004* UEFI OS
+       dp: HD(1,GPT,aaaabbbb-1111-2222-3333-444455556666,0x800,0x64000)/File(\EFI\BOOT\BOOTX64.EFI)
+               gpt/OptBefi:/EFI/BOOT/BOOTX64.EFI /boot/efi//EFI/BOOT/BOOTX64.EFI

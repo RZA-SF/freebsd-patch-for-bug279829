@@ -40,20 +40,13 @@ mock_cmd sysctl '
 case "$*" in
     *security.jail.jailed*) echo "0" ;;
     *machdep.bootmethod*)   echo "BIOS" ;;
+    *kern.disks*)           echo "ada0" ;;
     *) echo "0" ;;
 esac'
 
 mock_cmd_output uname "amd64"
 
-mock_cmd mount '
-case "$*" in
-    *msdosfs*)
-        # Should NOT be called in BIOS mode
-        echo "mount_msdosfs called unexpectedly in BIOS mode" >&2
-        exit 1
-        ;;
-    *) printf "zroot on / type zfs (local)\n" ;;
-esac'
+mock_cmd mount 'printf "{\"mount\":{\"mounted\":[{\"special\":\"zroot/ROOT/default\",\"node\":\"/\",\"fstype\":\"zfs\",\"opts\":[\"rw\",\"noatime\"]}]}}\n"'
 
 mock_cmd_output zfs "zroot"
 mock_cmd zpool '

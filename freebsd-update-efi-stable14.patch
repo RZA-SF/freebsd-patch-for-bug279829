@@ -1,8 +1,8 @@
 diff --git a/usr.sbin/freebsd-update/Makefile b/usr.sbin/freebsd-update/Makefile
-index 14e522adb..7969f19fc 100644
+index ebdf1e17d..8d3c7161e 100644
 --- a/usr.sbin/freebsd-update/Makefile
 +++ b/usr.sbin/freebsd-update/Makefile
-@@ -3,4 +3,9 @@ CONFS=	freebsd-update.conf
+@@ -2,4 +2,9 @@ CONFS=	freebsd-update.conf
  SCRIPTS=freebsd-update.sh
  MAN=	freebsd-update.8
  
@@ -14,69 +14,18 @@ index 14e522adb..7969f19fc 100644
  .include <bsd.prog.mk>
 diff --git a/usr.sbin/freebsd-update/efi_bootloader_update.sh b/usr.sbin/freebsd-update/efi_bootloader_update.sh
 new file mode 100755
-index 000000000..d433938f4
+index 000000000..1109e0748
 --- /dev/null
 +++ b/usr.sbin/freebsd-update/efi_bootloader_update.sh
-@@ -0,0 +1,842 @@
+@@ -0,0 +1,1185 @@
 +#!/bin/sh
 +#
 +# SPDX-License-Identifier: BSD-2-Clause
 +#
 +# Copyright (c) 2026 Ronald Pagani Jr.
 +#
-+# Redistribution and use in source and binary forms, with or without
-+# modification, are permitted provided that the following conditions
-+# are met:
-+# 1. Redistributions of source code must retain the above copyright
-+#    notice, this list of conditions and the following disclaimer.
-+# 2. Redistributions in binary form must reproduce the above copyright
-+#    notice, this list of conditions and the following disclaimer in
-+#    the documentation and/or other materials provided with the
-+#    distribution.
-+#
-+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS''
-+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
-+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
-+# PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR
-+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
-+# USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
-+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
-+# OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
-+# SUCH DAMAGE.
-+#
-+# efi_bootloader_update.sh — FreeBSD EFI/BIOS Bootloader Updater
-+#
-+# Automatically updates the EFI bootloader on the EFI System Partition (ESP)
-+# and the BIOS bootcode on freebsd-boot partitions during FreeBSD system
-+# upgrades.  Addresses FreeBSD bug 279829.
-+#
-+# Design goals:
-+#   - Safe: never blindly overwrites files belonging to other operating systems
-+#   - Complete: handles all supported architectures, disk topologies, FS types
-+#   - Idempotent: safe to run multiple times; re-running on an up-to-date system
-+#     is a no-op with informational output only
-+#   - Atomic: uses temp-file + rename to minimise the corruption window on FAT32
-+#   - Promote: creates /EFI/FreeBSD/loader.efi and an NVRAM entry when absent,
-+#     so future upgrades have a stable, OS-specific path to update
-+#
-+# Usage (standalone):
-+#   sh efi_bootloader_update.sh [--dry-run] [--verbose]
-+#
-+# Usage (sourced by freebsd-update):
-+#   . /usr/libexec/efi_bootloader_update.sh && update_bootloaders
-+#
-+# Environment overrides:
-+#   EFI_LOADER_SRC      Source loader (default: /boot/loader.efi)
-+#   EFI_DRY_RUN         Set to 1 for dry-run mode (default: 0)
-+#   EFI_VERBOSE         Set to 1 for debug output   (default: 0)
-+#   EFI_NVRAM_UPDATE    Set to 0 to skip NVRAM entry management (default: 1)
-+#   EFI_BIOS_PMBR       Path to pmbr boot record    (default: /boot/pmbr)
-+#   EFI_BIOS_ZFS_BOOT   Path to gptzfsboot          (default: /boot/gptzfsboot)
-+#   EFI_BIOS_UFS_BOOT   Path to gptboot             (default: /boot/gptboot)
-+#
++# Update the EFI bootloader on the ESP and BIOS bootcode on freebsd-boot
++# partitions during FreeBSD upgrades.  See freebsd-update(8).
 +
 +# Guard against double-sourcing
 +[ -n "${_EFI_BOOTLOADER_UPDATE_SH:-}" ] && return 0
@@ -98,6 +47,10 @@ index 000000000..d433938f4
 +# binary for it to be classified as a FreeBSD loader (reduces false-positives).
 +_EFI_FINGERPRINT_THRESHOLD=2
 +
++# Path to the EFI runtime services character device.  Overridable in tests
++# (e.g. _EFI_DEV_EFI=/dev/null to simulate EFIRT present on a non-FreeBSD host).
++: "${_EFI_DEV_EFI:=/dev/efi}"
++
 +# ============================================================
 +# LOGGING
 +# ============================================================
@@ -118,6 +71,7 @@ index 000000000..d433938f4
 +    case "$1" in
 +        amd64|x86_64)   echo "BOOTx64.efi"    ;;
 +        arm64|aarch64)  echo "BOOTaa64.efi"   ;;
++        arm|armv7)      echo "BOOTarm.efi"    ;;
 +        i386)           echo "BOOTia32.efi"    ;;
 +        riscv64)        echo "BOOTriscv64.efi" ;;
 +        *)              return 1               ;;
@@ -173,143 +127,454 @@ index 000000000..d433938f4
 +# Returns "UEFI", "BIOS", or "unknown"
 +efi_boot_method() {
 +    local m
-+    m=$(sysctl -n machdep.bootmethod 2>/dev/null) || { echo "unknown"; return; }
-+    echo "$m"
++    m=$(sysctl -n machdep.bootmethod 2>/dev/null) || {
++        # machdep.bootmethod is absent on some platforms (e.g. aarch64 with
++        # certain firmware).  Any modern FreeBSD platform lacking this OID
++        # uses UEFI — there is no BIOS boot on arm64, armv7, or riscv64.
++        _efi_verb "machdep.bootmethod unavailable; assuming UEFI"
++        echo "UEFI"
++        return
++    }
++    [ -n "$m" ] && { echo "$m"; return; }
++    _efi_verb "machdep.bootmethod returned empty; assuming UEFI"
++    echo "UEFI"
 +}
 +
 +# Returns the root filesystem type: "zfs", "ufs", or the raw type string.
-+# Handles both FreeBSD mount(8) format:  "dev on / (fstype, opts)"
-+# and Linux /proc/mounts format:          "dev on / type fstype (opts)"
++# Uses mount --libxo json (available FreeBSD 10.1+) for reliable parsing.
 +efi_root_fs_type() {
-+    mount 2>/dev/null | awk '
-+        $3 == "/" {
-+            if ($4 ~ /^\(/) {
-+                # FreeBSD: field 4 is "(fstype," — strip parens/comma
-+                t = $4; sub(/^\(/, "", t); sub(/[,)].*/, "", t); print t
-+            } else {
-+                # Linux: field 4 is "type", field 5 is the fstype
-+                print $5
-+            }
-+            exit
++    mount --libxo json 2>/dev/null | tr '}' '\n' | awk -F'"' '
++        /"node":"\/"/ {
++            for (i = 1; i <= NF; i++)
++                if ($i == "fstype") { print $(i+2); exit }
 +        }
 +    '
 +}
 +
 +# ============================================================
-+# DISK DISCOVERY
++# DISK AND PARTITION DISCOVERY
 +# ============================================================
 +
-+# Outputs one disk device name per line for every disk that participates in
-+# hosting the root filesystem.  Handles ZFS (single, mirror, raidz, gmirror
-+# members), UFS, and falls back to a best-effort search when root FS type is
-+# not recognised.
-+efi_discover_boot_disks() {
-+    local root_fs
-+    root_fs=$(efi_root_fs_type)
-+    _efi_verb "Root filesystem type: ${root_fs}"
++# Scan all disks visible to the kernel for EFI System Partitions.
++# Outputs one "disk part_index scheme" tuple per line.
++#
++# GPT: partitions of type "efi"
++# MBR: partitions of type "fat32lba" (0x0C), "fat32" (0x0B), or "efi" (0xEF)
++#       gpart uses symbolic names for known types; "!12"/"!ef" kept as fallback.
++#
++# The fingerprint check in efi_update_esp is the safety gate for MBR partitions:
++# if the mounted FAT32 does not contain a FreeBSD loader the partition is skipped.
++efi_discover_all_esps() {
++    local disks
++    disks=$(sysctl -n kern.disks 2>/dev/null | tr ' ' '\n') || {
++        _efi_warn "Cannot enumerate disks via sysctl kern.disks"
++        return 1
++    }
 +
-+    local disks=""
-+    case "$root_fs" in
++    local disk found=0
++    for disk in $disks; do
++        [ -z "$disk" ] && continue
++        local gpart_out scheme parts
++        gpart_out=$(gpart show "$disk" 2>/dev/null) || continue
++
++        # Header line: => start size device SCHEME (size)
++        scheme=$(printf '%s\n' "$gpart_out" | awk '$1 == "=>" { print $5; exit }')
++
++        case "$scheme" in
++            GPT)
++                parts=$(printf '%s\n' "$gpart_out" | \
++                    awk -v d="$disk" '$4 == "efi" { print d, $3, "GPT" }')
++                ;;
++            MBR)
++                parts=$(printf '%s\n' "$gpart_out" | \
++                    awk -v d="$disk" '$4 == "fat32lba" || $4 == "fat32" || $4 == "efi" || $4 == "!12" || $4 == "!ef" { print d, $3, "MBR" }')
++                ;;
++            *)
++                _efi_verb "Skipping ${disk}: unrecognised partition scheme '${scheme}'"
++                continue
++                ;;
++        esac
++
++        if [ -n "$parts" ]; then
++            printf '%s\n' "$parts"
++            found=1
++        fi
++    done
++
++    [ "$found" -eq 0 ] && return 1
++    return 0
++}
++
++# Scan all disks for freebsd-boot partitions (GPT only; type is FreeBSD-specific).
++# Outputs one "disk part_index" tuple per line.
++efi_discover_all_bios_parts() {
++    local disks
++    disks=$(sysctl -n kern.disks 2>/dev/null | tr ' ' '\n') || {
++        _efi_warn "Cannot enumerate disks via sysctl kern.disks"
++        return 1
++    }
++
++    local disk found=0
++    for disk in $disks; do
++        [ -z "$disk" ] && continue
++        local parts
++        parts=$(gpart show "$disk" 2>/dev/null | \
++            awk -v d="$disk" '$4 == "freebsd-boot" { print d, $3 }') || true
++        if [ -n "$parts" ]; then
++            printf '%s\n' "$parts"
++            found=1
++        fi
++    done
++
++    [ "$found" -eq 0 ] && return 1
++    return 0
++}
++
++# ============================================================
++# ROOT FILESYSTEM DISK IDENTIFICATION
++# ============================================================
++
++# Returns disk names (one per line) hosting the current root filesystem.
++# Argument: root filesystem type ("zfs" or "ufs")
++# ZFS: parses zpool status to find leaf vdev member disks; strips partition suffix.
++#      Handles diskid/ and gptid/ aliases via realpath.
++# UFS: parses mount --libxo json root "special" device; strips /dev/ prefix and suffix.
++# Returns 1 on failure or unknown type.
++efi_root_disks() {
++    local root_type="$1"
++
++    case "$root_type" in
 +        zfs)
-+            disks=$(efi_zfs_boot_disks) ;;
++            # Extract pool name from root "special" field (e.g. "zroot/ROOT/default" -> "zroot")
++            local pool_name
++            pool_name=$(mount --libxo json 2>/dev/null | tr '}' '\n' | awk -F'"' '
++                /"node":"\/"/ {
++                    for (i = 1; i <= NF; i++)
++                        if ($i == "special") { print $(i+2); exit }
++                }
++            ' | cut -d/ -f1)
++
++            if [ -z "$pool_name" ]; then
++                _efi_warn "efi_root_disks: cannot determine ZFS pool name from mount output"
++                return 1
++            fi
++
++            local zpool_out
++            zpool_out=$(zpool status "$pool_name" 2>/dev/null) || {
++                _efi_warn "efi_root_disks: zpool status ${pool_name} failed"
++                return 1
++            }
++
++            # Parse leaf vdev members from the config: section of zpool status.
++            # Skips pool-level metadata (state:, scan:) by starting after "config:".
++            # Excludes the pool name itself, the NAME header, and vdev group names
++            # (mirror-0, raidz1-0, etc.).  Handles raw device names (nda0p4),
++            # GEOM labels (gpt/OptBzfs), and aliases (diskid/DISK-xxx, gptid/GUID).
++            printf '%s\n' "$zpool_out" | awk -v pool="$pool_name" '
++                /^config:/ { in_config = 1; next }
++                in_config &&
++                $1 != pool && $1 !~ /^NAME$/ &&
++                $2 ~ /^(ONLINE|DEGRADED|FAULTED|OFFLINE|REMOVED|UNAVAIL)$/ &&
++                $1 !~ /-[0-9]+$/ {
++                    print $1
++                }
++            ' | while IFS= read -r vdev; do
++                case "$vdev" in
++                    diskid/*|gptid/*|gpt/*)
++                        # Resolve alias to real device.  On some FreeBSD versions
++                        # GEOM label paths are device nodes, not symlinks, so
++                        # realpath(1) returns the path unchanged.  Fall back to
++                        # glabel status to find the backing partition.
++                        local real
++                        real=$(realpath "/dev/${vdev}" 2>/dev/null) || continue
++                        case "$real" in
++                            /dev/gpt/*|/dev/diskid/*|/dev/gptid/*)
++                                local component
++                                component=$(glabel status 2>/dev/null | awk \
++                                    -v lbl="${vdev}" \
++                                    '$1 == lbl { print $NF; exit }')
++                                [ -n "$component" ] || continue
++                                real="/dev/${component}"
++                                ;;
++                        esac
++                        real="${real#/dev/}"
++                        real=$(printf '%s' "$real" | sed 's/[sp][0-9]*$//')
++                        [ -n "$real" ] && echo "$real"
++                        ;;
++                    *)
++                        # Strip partition suffix
++                        local disk
++                        disk=$(printf '%s' "$vdev" | sed 's/[sp][0-9]*$//')
++                        [ -n "$disk" ] && echo "$disk"
++                        ;;
++                esac
++            done | sort -u
++            ;;
++
 +        ufs)
-+            disks=$(efi_ufs_boot_disks) ;;
++            # Get root device from mount --libxo json "special" field
++            local root_dev
++            root_dev=$(mount --libxo json 2>/dev/null | tr '}' '\n' | awk -F'"' '
++                /"node":"\/"/ {
++                    for (i = 1; i <= NF; i++)
++                        if ($i == "special") { print $(i+2); exit }
++                }
++            ')
++
++            if [ -z "$root_dev" ]; then
++                _efi_warn "efi_root_disks: cannot determine UFS root device from mount output"
++                return 1
++            fi
++
++            # Strip /dev/ prefix
++            root_dev="${root_dev#/dev/}"
++
++            # Resolve GEOM label and alias paths to real device names.
++            # mount --libxo json reports the device as the kernel's geom provider
++            # name (e.g. "gpt/PBaseUFS", "ufs/rootfs", "diskid/DISK-XXXpN"),
++            # which gpart cannot accept as a disk argument.  realpath(1) resolves
++            # the label when /dev/X is a symlink; on newer kernels these are device
++            # nodes so realpath returns the path unchanged.  glabel status is
++            # used as a fallback to find the backing partition in that case.
++            case "$root_dev" in
++                gpt/*|diskid/*|gptid/*|ufs/*)
++                    local real
++                    real=$(realpath "/dev/${root_dev}" 2>/dev/null) || {
++                        _efi_warn "efi_root_disks: cannot resolve /dev/${root_dev} to real device"
++                        return 1
++                    }
++                    case "$real" in
++                        /dev/gpt/*|/dev/diskid/*|/dev/gptid/*|/dev/ufs/*)
++                            local component
++                            component=$(glabel status 2>/dev/null | awk \
++                                -v lbl="${root_dev}" \
++                                '$1 == lbl { print $NF; exit }')
++                            if [ -z "$component" ]; then
++                                _efi_warn "efi_root_disks: cannot find backing device for /dev/${root_dev}"
++                                return 1
++                            fi
++                            real="/dev/${component}"
++                            ;;
++                    esac
++                    root_dev="${real#/dev/}"
++                    ;;
++            esac
++
++            # Strip partition suffix (GPT: pN; MBR slice: sN; MBR BSD: sNa).
++            # Require at least one digit after [sp] so bare trailing letters in
++            # GEOM label names (e.g. "rootfs") are never accidentally stripped.
++            root_dev=$(printf '%s' "$root_dev" | sed 's/[sp][0-9]\{1,\}[a-z]\{0,1\}$//')
++            [ -n "$root_dev" ] && echo "$root_dev"
++            ;;
++
 +        *)
-+            _efi_warn "Unrecognised root FS type '${root_fs}'; trying ZFS then UFS discovery"
-+            disks=$(efi_zfs_boot_disks 2>/dev/null) || true
-+            [ -z "$disks" ] && disks=$(efi_ufs_boot_disks 2>/dev/null) || true
++            _efi_warn "efi_root_disks: unknown root type '${root_type}'"
++            return 1
 +            ;;
 +    esac
++}
 +
-+    if [ -z "$disks" ]; then
-+        _efi_warn "No boot disks found"
++# ============================================================
++# BOOT-SPECIFIC PARTITION DISCOVERY
++# ============================================================
++
++# Identify EFI System Partitions belonging to the current system only.
++# Uses the union of:
++#   1. EFI BootCurrent NVRAM variable -> PARTUUID -> gpart list rawuuid match
++#   2. Root filesystem disk(s) via efi_root_disks
++# Outputs one "disk part_index scheme" tuple per line.
++# Returns 1 if no ESPs found.
++efi_boot_esps() {
++    local root_type
++    root_type=$(efi_root_fs_type)
++
++    # ── Step 1: Try efibootmgr to identify BootCurrent disk ──────────────────
++    local boot_partuuid=""
++    if command -v efibootmgr >/dev/null 2>&1; then
++        local efibm_out
++        if ! [ -c "${_EFI_DEV_EFI}" ]; then
++            _efi_verb "EFIRT (/dev/efi) unavailable — skipping BootCurrent NVRAM lookup"
++            efibm_out=""
++        else
++            efibm_out=$(efibootmgr -v 2>/dev/null) || efibm_out=""
++        fi
++
++        local current_num
++        current_num=$(printf '%s\n' "$efibm_out" | sed -n 's/^BootCurrent: *//p')
++
++        if [ -n "$current_num" ]; then
++            # Extract PARTUUID from HD(N,GPT,<UUID>,...) for the BootCurrent entry.
++            # Two efibootmgr -v formats exist:
++            #   Inline:  "+Boot0004* desc<TAB>HD(1,GPT,UUID,...)/File(...)"
++            #   dp-line: "+Boot0004* desc\n       dp: HD(1,GPT,UUID,...)/File(...)"
++            # Use awk to match the entry line then scan forward for HD(N,GPT,...),
++            # stopping if the next boot entry is reached.
++            boot_partuuid=$(printf '%s\n' "$efibm_out" | awk \
++                -v pat="Boot${current_num}[* ]" '
++                $0 ~ pat { found = 1 }
++                found && /HD\([0-9]*,GPT,/ {
++                    s = $0
++                    sub(/.*HD\([0-9]*,GPT,/, "", s)
++                    sub(/,.*/, "", s)
++                    if (s != "") { print s; exit }
++                }
++                found && /^[+ ]Boot[0-9]/ && $0 !~ pat { exit }
++            ')
++        fi
++    fi
++
++    # ── Step 2: Get root filesystem disks ────────────────────────────────────
++    local root_disk_list=""
++    root_disk_list=$(efi_root_disks "$root_type") || root_disk_list=""
++
++    # ── Step 3: Build candidate_disks ────────────────────────────────────────
++    local candidate_disks=""
++    local _boot_disks=""
++
++    if [ -n "$boot_partuuid" ]; then
++        # Enumerate all disks and check gpart list rawuuid fields
++        local all_disks
++        all_disks=$(sysctl -n kern.disks 2>/dev/null | tr ' ' '\n') || all_disks=""
++
++        local d
++        for d in $all_disks; do
++            [ -z "$d" ] && continue
++            local glist_out
++            glist_out=$(gpart list "$d" 2>/dev/null) || continue
++
++            # Case-insensitive UUID comparison using awk tolower()
++            local matched
++            matched=$(printf '%s\n' "$glist_out" | awk -v uuid="$boot_partuuid" '
++                tolower($0) ~ "rawuuid:" {
++                    # $NF is the UUID value
++                    if (tolower($NF) == tolower(uuid)) { print "yes"; exit }
++                }
++            ')
++            if [ "$matched" = "yes" ]; then
++                _boot_disks="${_boot_disks}${d}
++"
++            fi
++        done
++    fi
++
++    if [ -n "$_boot_disks" ]; then
++        candidate_disks="$_boot_disks"
++
++        # Check whether the identified boot disk(s) overlap with the root
++        # filesystem disk(s).  No overlap means split-media or a dedicated
++        # boot disk: the root disk(s) are not part of this system's boot
++        # path.  In that case, restrict updates to the boot disk only —
++        # adding root disks could update an ESP on shared media that belongs
++        # to another system, not the one currently running.
++        #
++        # Overlap (the common case, including ZFS mirrors where the boot disk
++        # is also a pool member): add all root disks so every mirror member's
++        # ESP is kept in sync.
++        local _overlap=0
++        local _bd
++        for _bd in $_boot_disks; do
++            if printf '%s\n' "$root_disk_list" | grep -qx "$_bd"; then
++                _overlap=1
++                break
++            fi
++        done
++
++        if [ "$_overlap" = "1" ]; then
++            # Normal or mirror: boot disk is a root disk — include all root disks.
++            if [ -n "$root_disk_list" ]; then
++                candidate_disks="${candidate_disks}${root_disk_list}
++"
++            fi
++        else
++            # Split-media or dedicated boot disk: restrict to boot disk only.
++            _efi_verb "Boot disk differs from root filesystem disk(s) — restricting ESP updates to boot disk"
++        fi
++    else
++        # BootCurrent PARTUUID not matched — fall back to root disks only.
++        if [ -n "$root_disk_list" ]; then
++            candidate_disks="${root_disk_list}
++"
++        fi
++    fi
++
++    # ── Step 4: Deduplicate candidate_disks ──────────────────────────────────
++    local deduped_disks
++    deduped_disks=$(printf '%s' "$candidate_disks" | sort -u | grep -v '^$') || deduped_disks=""
++
++    if [ -z "$deduped_disks" ]; then
++        _efi_warn "efi_boot_esps: cannot determine boot/root disks"
 +        return 1
 +    fi
 +
-+    echo "$disks"
-+}
++    # ── Step 5: Scan each candidate disk for ESP partitions ──────────────────
++    local found=0
++    local disk
++    for disk in $deduped_disks; do
++        [ -z "$disk" ] && continue
++        local gpart_out scheme parts
++        gpart_out=$(gpart show "$disk" 2>/dev/null) || continue
 +
-+# Discover all physical disks that are members of the ZFS root pool.
-+# Handles mirrors, raidz, and nested vdevs.  gmirror members are expanded.
-+efi_zfs_boot_disks() {
-+    local pool
-+    pool=$(zfs get -H -o value name / 2>/dev/null | cut -d/ -f1) || {
-+        _efi_warn "Cannot determine ZFS root pool name"
-+        return 1
-+    }
-+    _efi_verb "ZFS root pool: ${pool}"
++        scheme=$(printf '%s\n' "$gpart_out" | awk '$1 == "=>" { print $5; exit }')
 +
-+    # Parse `zpool status` config section.  Lines whose first field matches a
-+    # known block-device naming pattern are physical vdev leaves.  Virtual vdev
-+    # names (mirror-N, raidz*-N, spare, cache, log, NAME header) are skipped.
-+    zpool status "$pool" 2>/dev/null | awk '
-+        /^config:/  { in_cfg = 1; next }
-+        /^errors:/  { in_cfg = 0 }
-+        !in_cfg     { next }
-+        # Skip the column header and virtual-vdev labels
-+        /^[[:space:]]*(NAME|mirror|raidz|spare|cache|log|replacing|removing)/ { next }
-+        /^[[:space:]]+[a-z]/ {
-+            dev = $1
-+            # Strip slice/partition suffix (e.g. nda0p4 → nda0, ada0s1a → ada0)
-+            sub(/[sp][0-9]+[a-z]?$/, "", dev)
-+            # Emit only recognisable disk device names
-+            if (dev ~ /^(da|ada|nda|nvd|vtblk|xbd|mmcsd|cd|md)[0-9]/) print dev
-+        }
-+    ' | sort -u | while IFS= read -r dev; do
-+        # Expand gmirror virtual devices (mirror/gmX) to their member disks
-+        case "$dev" in
-+            gm[0-9]*)
-+                efi_gmirror_members "$dev" ;;
++        case "$scheme" in
++            GPT)
++                parts=$(printf '%s\n' "$gpart_out" | \
++                    awk -v d="$disk" '$4 == "efi" { print d, $3, "GPT" }')
++                ;;
++            MBR)
++                parts=$(printf '%s\n' "$gpart_out" | \
++                    awk -v d="$disk" '$4 == "fat32lba" || $4 == "fat32" || $4 == "efi" || $4 == "!12" || $4 == "!ef" { print d, $3, "MBR" }')
++                ;;
 +            *)
-+                echo "$dev" ;;
++                _efi_verb "efi_boot_esps: skipping ${disk}: unrecognised scheme '${scheme}'"
++                continue
++                ;;
 +        esac
-+    done | sort -u
++
++        if [ -n "$parts" ]; then
++            printf '%s\n' "$parts"
++            found=1
++        fi
++    done
++
++    [ "$found" -eq 0 ] && return 1
++    return 0
 +}
 +
-+# Discover the boot disk from a UFS root via /etc/fstab.
-+efi_ufs_boot_disks() {
-+    local root_dev
-+    root_dev=$(awk '$2 == "/" && $1 !~ /^#/ { print $1; exit }' /etc/fstab 2>/dev/null) || {
-+        _efi_warn "Cannot determine root device from /etc/fstab"
++# Identify freebsd-boot partitions belonging to the current system only.
++# Uses root filesystem disk(s) via efi_root_disks.
++# Outputs one "disk part_index" tuple per line.
++# Returns 1 if root disks cannot be determined or no freebsd-boot partitions found.
++efi_boot_bios_parts() {
++    local root_type
++    root_type=$(efi_root_fs_type)
++
++    local root_disks
++    root_disks=$(efi_root_disks "$root_type") || {
++        _efi_warn "efi_boot_bios_parts: cannot determine root filesystem disks"
 +        return 1
 +    }
-+    root_dev="${root_dev#/dev/}"                   # strip /dev/ prefix
-+    case "$root_dev" in                            # strip partition/slice suffix
-+        *p[0-9]*)  root_dev="${root_dev%%p[0-9]*}" ;;   # GPT: ada0p2 -> ada0
-+        *s[0-9]*)  root_dev="${root_dev%%s[0-9]*}" ;;   # MBR: nda0s1a -> nda0
-+    esac
-+    [ -n "$root_dev" ] && echo "$root_dev"
-+}
 +
-+# Expand a gmirror device name to its physical member disk names.
-+efi_gmirror_members() {
-+    local mirror_name="$1"
-+    gmirror status 2>/dev/null | awk -v name="$mirror_name" '
-+        $0 ~ name { found = 1 }
-+        found && /(ACTIVE|PASSIVE|SYNCHRONIZING)/ {
-+            dev = $NF
-+            gsub(/\(.*\)/, "", dev)      # remove "(STATE)" annotation
-+            gsub(/[[:space:]]/, "", dev)
-+            sub(/[sp][0-9]+[a-z]?$/, "", dev)   # strip partition suffix
-+            if (dev != "") print dev
-+        }
-+    '
-+}
++    if [ -z "$root_disks" ]; then
++        _efi_warn "efi_boot_bios_parts: root disk list is empty"
++        return 1
++    fi
 +
-+# ============================================================
-+# PARTITION DISCOVERY
-+# ============================================================
++    local found=0
++    local disk
++    for disk in $root_disks; do
++        [ -z "$disk" ] && continue
++        local parts
++        parts=$(gpart show "$disk" 2>/dev/null | \
++            awk -v d="$disk" '$4 == "freebsd-boot" { print d, $3 }') || true
++        if [ -n "$parts" ]; then
++            printf '%s\n' "$parts"
++            found=1
++        fi
++    done
 +
-+# Output the partition index(es) of type "efi" on the given disk.
-+efi_efi_partitions() {
-+    local disk="$1"
-+    gpart show "$disk" 2>/dev/null | awk '$4 == "efi" { print $3 }'
-+}
-+
-+# Output the partition index(es) of type "freebsd-boot" on the given disk.
-+efi_bios_partitions() {
-+    local disk="$1"
-+    gpart show "$disk" 2>/dev/null | awk '$4 == "freebsd-boot" { print $3 }'
++    [ "$found" -eq 0 ] && return 1
++    return 0
 +}
 +
 +# ============================================================
@@ -319,6 +584,9 @@ index 000000000..d433938f4
 +# Module-level state for the current ESP mount operation.
 +_efi_esp_mp=""          # Current ESP mountpoint
 +_efi_esp_did_mount=0    # 1 if we mounted it (we must unmount)
++_efi_esp_is_real=0      # 1 if esp_mp points to a real accessible ESP
++                        # (pre-mounted or actually mounted); 0 in dry-run
++                        # with an empty tmpdir
 +_efi_tmp_mounts=""      # All temp mounts we created (space-separated)
 +
 +# Remove all temporary mounts created by this script.  Called from EXIT trap.
@@ -336,19 +604,69 @@ index 000000000..d433938f4
 +efi_esp_mountpoint() {
 +    local device="$1"
 +    case "$device" in /dev/*) ;; *) device="/dev/${device}" ;; esac
-+    mount 2>/dev/null | awk -v d="$device" '$1 == d { print $3; exit }'
++
++    local mount_json
++    mount_json=$(mount --libxo json 2>/dev/null)
++
++    # First: direct device path match (common case — GPT disks, any system
++    # where mount reports the raw device node as special).
++    local result
++    result=$(printf '%s\n' "$mount_json" | tr '}' '\n' | awk -F'"' \
++        -v dev="$device" '
++        {
++            special = ""; node = ""
++            for (i = 1; i <= NF; i++) {
++                if ($i == "special") special = $(i+2)
++                if ($i == "node") node = $(i+2)
++            }
++            if (special == dev && node != "") { print node; exit }
++        }
++    ')
++    [ -n "$result" ] && { echo "$result"; return; }
++
++    # Second: GEOM label resolution.  mount(8) may report the device under
++    # a GEOM label path rather than the raw device node — for example,
++    # /dev/msdosfs/EFI when a FAT ESP with volume label "EFI" is mounted.
++    # Use glabel status to resolve each label to its backing component and
++    # compare against the requested device.
++    local dev_base="${device#/dev/}"
++    local glabel_out
++    glabel_out=$(glabel status 2>/dev/null)
++    result=$(printf '%s\n' "$mount_json" | tr '}' '\n' | awk -F'"' '
++        {
++            special = ""; node = ""
++            for (i = 1; i <= NF; i++) {
++                if ($i == "special") special = $(i+2)
++                if ($i == "node") node = $(i+2)
++            }
++            if (special ~ "^/dev/" && node != "") print special " " node
++        }
++    ' | while read -r special node; do
++        lbl="${special#/dev/}"
++        component=$(printf '%s\n' "$glabel_out" | \
++            awk -v l="$lbl" '$1 == l { print $NF; exit }')
++        [ "$component" = "$dev_base" ] && { echo "$node"; break; }
++    done)
++    [ -n "$result" ] && echo "$result"
 +}
 +
 +# Mount the EFI System Partition at a temporary directory.
 +# Sets _efi_esp_mp and _efi_esp_did_mount.
 +# Returns 0 on success, 1 on failure.
++# $3: partition scheme — "GPT" (default, uses pN suffix) or "MBR" (uses sN suffix)
 +efi_mount_esp() {
 +    local disk="$1"
 +    local part_index="$2"
-+    local device="/dev/${disk}p${part_index}"
++    local scheme="${3:-GPT}"
++    local device
++    case "$scheme" in
++        MBR) device="/dev/${disk}s${part_index}" ;;
++        *)   device="/dev/${disk}p${part_index}" ;;
++    esac
 +
 +    _efi_esp_mp=""
 +    _efi_esp_did_mount=0
++    _efi_esp_is_real=0
 +
 +    # Reuse an existing mount if the device is already mounted.
 +    local existing
@@ -357,6 +675,7 @@ index 000000000..d433938f4
 +        _efi_verb "ESP ${device} already mounted at ${existing}"
 +        _efi_esp_mp="$existing"
 +        _efi_esp_did_mount=0
++        _efi_esp_is_real=1
 +        return 0
 +    fi
 +
@@ -370,6 +689,7 @@ index 000000000..d433938f4
 +        _efi_info "[DRY RUN] Would mount ${device} at ${tmp_mp}"
 +        _efi_esp_mp="$tmp_mp"
 +        _efi_esp_did_mount=1
++        _efi_esp_is_real=0
 +        _efi_tmp_mounts="${_efi_tmp_mounts} ${tmp_mp}"
 +        return 0
 +    fi
@@ -382,6 +702,7 @@ index 000000000..d433938f4
 +
 +    _efi_esp_mp="$tmp_mp"
 +    _efi_esp_did_mount=1
++    _efi_esp_is_real=1
 +    _efi_tmp_mounts="${_efi_tmp_mounts} ${tmp_mp}"
 +    _efi_verb "Mounted ${device} at ${tmp_mp}"
 +    return 0
@@ -402,6 +723,7 @@ index 000000000..d433938f4
 +    fi
 +    _efi_esp_mp=""
 +    _efi_esp_did_mount=0
++    _efi_esp_is_real=0
 +}
 +
 +# ============================================================
@@ -409,23 +731,34 @@ index 000000000..d433938f4
 +# ============================================================
 +
 +# Returns 0 if the given file appears to be a FreeBSD EFI loader binary.
-+# Requires at least _EFI_FINGERPRINT_THRESHOLD of the following strings to
-+# be present: "FreeBSD", "loader.efi", "boot/lua".
-+# Using multiple strings substantially reduces the false-positive risk that
-+# arises from checking only for "FreeBSD" (which could appear in any binary).
++#
++# Primary check: bootprog_info string embedded by newvers.sh in all FreeBSD
++# loaders since FreeBSD 11 — "FreeBSD/<arch> EFI, Revision N.N".  This
++# pattern is specific enough to eliminate false positives from other OSes.
++#
++# Fallback: multi-string heuristic requiring _EFI_FINGERPRINT_THRESHOLD of
++# "FreeBSD", "loader.efi", "boot/lua" — covers older binaries that predate
++# the bootprog_info format.
 +efi_is_freebsd_loader() {
 +    local file="$1"
 +
 +    [ -f "$file" ] || return 1
 +    [ -s "$file" ] || return 1   # must be non-empty
 +
++    # Primary: match the bootprog_info pattern.
++    if strings "$file" 2>/dev/null | grep -qE 'FreeBSD/[^ ]+ EFI,'; then
++        _efi_verb "Fingerprint '${file}': bootprog_info match"
++        return 0
++    fi
++
++    # Fallback: multi-string heuristic for binaries without bootprog_info.
 +    local matches=0 sig
 +    for sig in "FreeBSD" "loader.efi" "boot/lua"; do
 +        strings "$file" 2>/dev/null | grep -qF "$sig" && \
 +            matches=$((matches + 1))
 +    done
 +
-+    _efi_verb "Fingerprint '${file}': ${matches}/${_EFI_FINGERPRINT_THRESHOLD} match(es)"
++    _efi_verb "Fingerprint '${file}': ${matches}/${_EFI_FINGERPRINT_THRESHOLD} heuristic match(es)"
 +    [ "$matches" -ge "${_EFI_FINGERPRINT_THRESHOLD}" ]
 +}
 +
@@ -443,6 +776,11 @@ index 000000000..d433938f4
 +        _efi_err "Cannot stat ${EFI_LOADER_SRC}"
 +        return 1
 +    }
++
++    if [ "${EFI_DRY_RUN}" = "1" ] && [ "${_efi_esp_is_real:-0}" != "1" ]; then
++        _efi_verb "[DRY RUN] Space check skipped (ESP not mounted)"
++        return 0
++    fi
 +
 +    local avail_kb
 +    avail_kb=$(df -k "$esp_mount" 2>/dev/null | awk 'NR==2 { print $4 }') || {
@@ -516,7 +854,8 @@ index 000000000..d433938f4
 +
 +# Ensure a FreeBSD NVRAM boot entry pointing to /EFI/FreeBSD/loader.efi exists.
 +# Non-fatal: many systems boot fine without an explicit NVRAM entry (fallback
-+# path covers them) and efibootmgr may not be installed.
++# path covers them), efibootmgr may not be installed, or EFIRT (/dev/efi) may
++# be unavailable (custom kernel without options EFIRT, or i386/armv7/riscv64).
 +efi_ensure_nvram_entry() {
 +    local esp_mount="$1"
 +    local freebsd_loader_abs="$2"  # absolute path on mounted ESP
@@ -529,6 +868,10 @@ index 000000000..d433938f4
 +    command -v efibootmgr >/dev/null 2>&1 || {
 +        _efi_warn "efibootmgr not found — cannot verify NVRAM boot entry"
 +        _efi_warn "Ensure UEFI NVRAM has a FreeBSD entry pointing to the loader"
++        return 0
++    }
++    [ -c "${_EFI_DEV_EFI}" ] || {
++        _efi_verb "EFIRT (/dev/efi) unavailable — skipping NVRAM boot entry management"
 +        return 0
 +    }
 +
@@ -558,7 +901,7 @@ index 000000000..d433938f4
 +    # device path itself.
 +    efibootmgr -a -c -l "$freebsd_loader_abs" -L "FreeBSD" >/dev/null 2>&1 || {
 +        _efi_warn "efibootmgr failed to create NVRAM entry"
-+        _efi_warn "Mount ESP and run: efibootmgr -a -c -l '<esp>/EFI/FreeBSD/loader.efi' -L FreeBSD"
++        _efi_warn "Run as root: efibootmgr -a -c -l '${freebsd_loader_abs}' -L FreeBSD"
 +        return 0   # still non-fatal
 +    }
 +    _efi_info "NVRAM boot entry created"
@@ -571,8 +914,18 @@ index 000000000..d433938f4
 +    local fallback_binary="$2"   # e.g. "BOOTx64.efi"
 +    local disk="$3"
 +    local part_index="$4"
++    local scheme="${5:-GPT}"
++    local device
++    case "$scheme" in
++        MBR) device="/dev/${disk}s${part_index}" ;;
++        *)   device="/dev/${disk}p${part_index}" ;;
++    esac
 +
 +    local updated=0 errors=0
++
++    if [ "${EFI_DRY_RUN}" = "1" ] && [ "${_efi_esp_is_real:-0}" != "1" ]; then
++        _efi_info "[DRY RUN] ESP not mounted — existing file/directory detection skipped; output reflects a blank ESP"
++    fi
 +
 +    # ── 1.  OS-specific path: /EFI/FreeBSD/loader.efi ─────────────────────────
 +    #
@@ -655,9 +1008,9 @@ index 000000000..d433938f4
 +
 +    # ── Summary ────────────────────────────────────────────────────────────────
 +    [ "$updated" -gt 0 ] && \
-+        _efi_info "Updated ${updated} EFI loader file(s) on /dev/${disk}p${part_index}"
++        _efi_info "Updated ${updated} EFI loader file(s) on ${device}"
 +    [ "$errors" -gt 0 ] && {
-+        _efi_warn "${errors} error(s) updating ESP on /dev/${disk}p${part_index}"
++        _efi_warn "${errors} error(s) updating ESP on ${device}"
 +        return 1
 +    }
 +    return 0
@@ -739,69 +1092,59 @@ index 000000000..d433938f4
 +        }
 +    fi
 +
-+    # ── Discover boot disks ────────────────────────────────────────────────────
-+    local disks
-+    if ! disks=$(efi_discover_boot_disks); then
-+        _efi_warn "Boot disk discovery failed"
-+        _efi_warn "If using hardware RAID or an exotic topology, update the bootloader manually"
-+        return 0   # Non-fatal: warn and let the user continue
-+    fi
-+
-+    _efi_info "Boot disk(s): $(printf '%s' "$disks" | tr '\n' ' ')"
-+
 +    # Register cleanup so temp mounts are removed even on error or signal.
 +    trap 'efi_cleanup_mounts' EXIT INT TERM
 +
-+    # ── Per-disk processing ────────────────────────────────────────────────────
-+    local disk
-+    for disk in $disks; do
-+        _efi_verb "--- Processing disk: ${disk} ---"
++    # ── EFI System Partitions — scoped to current system's boot/root disks ────
++    if [ "$boot_method" = "UEFI" ] && [ -n "$fallback_binary" ]; then
++        local esp_list
++        esp_list=$(efi_boot_esps) || {
++            _efi_warn "No EFI System Partitions found for this system's boot/root disks"
++            _efi_warn "If using hardware RAID or an unusual topology, update the bootloader manually"
++        }
 +
-+        # ── EFI System Partition ───────────────────────────────────────────────
-+        if [ "$boot_method" = "UEFI" ] && [ -n "$fallback_binary" ]; then
-+            local efi_parts
-+            efi_parts=$(efi_efi_partitions "$disk")
++        if [ -n "$esp_list" ]; then
++            local esp_disk esp_pidx esp_scheme
++            while IFS=' ' read -r esp_disk esp_pidx esp_scheme; do
++                _efi_info "Processing EFI partition: ${esp_disk} partition ${esp_pidx} (${esp_scheme})"
 +
-+            if [ -z "$efi_parts" ]; then
-+                _efi_verb "No EFI partition on ${disk}"
-+            else
-+                local pidx
-+                for pidx in $efi_parts; do
-+                    _efi_info "Processing EFI partition: ${disk}p${pidx}"
-+
-+                    if ! efi_mount_esp "$disk" "$pidx"; then
-+                        _efi_err "Skipping ${disk}p${pidx} — mount failed"
-+                        total_errors=$((total_errors + 1))
-+                        continue
-+                    fi
-+
-+                    local esp_mp="${_efi_esp_mp}"
-+
-+                    if ! efi_check_space "$esp_mp"; then
-+                        total_errors=$((total_errors + 1))
-+                        efi_unmount_esp
-+                        continue
-+                    fi
-+
-+                    efi_update_esp "$esp_mp" "$fallback_binary" "$disk" "$pidx" || \
-+                        total_errors=$((total_errors + 1))
-+
-+                    efi_unmount_esp
-+                done
-+            fi
-+        fi
-+
-+        # ── BIOS freebsd-boot partition ────────────────────────────────────────
-+        local bios_parts
-+        bios_parts=$(efi_bios_partitions "$disk")
-+        if [ -n "$bios_parts" ]; then
-+            local bidx
-+            for bidx in $bios_parts; do
-+                efi_update_bios_bootcode "$disk" "$bidx" || \
++                if ! efi_mount_esp "$esp_disk" "$esp_pidx" "$esp_scheme"; then
++                    _efi_err "Skipping ${esp_disk} partition ${esp_pidx} — mount failed"
 +                    total_errors=$((total_errors + 1))
-+            done
++                    continue
++                fi
++
++                local esp_mp="${_efi_esp_mp}"
++
++                if ! efi_check_space "$esp_mp"; then
++                    total_errors=$((total_errors + 1))
++                    efi_unmount_esp
++                    continue
++                fi
++
++                efi_update_esp "$esp_mp" "$fallback_binary" "$esp_disk" "$esp_pidx" "$esp_scheme" || \
++                    total_errors=$((total_errors + 1))
++
++                efi_unmount_esp
++            done <<_ESPS_
++$esp_list
++_ESPS_
 +        fi
-+    done
++    fi
++
++    # ── BIOS freebsd-boot partitions — scoped to root filesystem disks ────────
++    local bios_list
++    bios_list=$(efi_boot_bios_parts) || true
++
++    if [ -n "$bios_list" ]; then
++        local bios_disk bios_pidx
++        while IFS=' ' read -r bios_disk bios_pidx; do
++            efi_update_bios_bootcode "$bios_disk" "$bios_pidx" || \
++                total_errors=$((total_errors + 1))
++        done <<_BIOS_
++$bios_list
++_BIOS_
++    fi
 +
 +    # ── Final status ───────────────────────────────────────────────────────────
 +    if [ "$total_errors" -gt 0 ]; then
@@ -861,10 +1204,10 @@ index 000000000..d433938f4
 +    exit $?
 +fi
 diff --git a/usr.sbin/freebsd-update/freebsd-update.8 b/usr.sbin/freebsd-update/freebsd-update.8
-index 024185198..1367f5cb1 100644
+index cdb4915f7..1330acb28 100644
 --- a/usr.sbin/freebsd-update/freebsd-update.8
 +++ b/usr.sbin/freebsd-update/freebsd-update.8
-@@ -192,6 +192,22 @@ Install the most recently fetched updates or upgrade.
+@@ -203,6 +203,22 @@ Install the most recently fetched updates or upgrade.
  Returns exit code 2 if there are no updates to install and the
  .Cm fetch
  command wasn't passed as an earlier argument in the same invocation.
@@ -887,7 +1230,7 @@ index 024185198..1367f5cb1 100644
  .It Cm rollback
  Uninstall the most recently installed updates.
  .It Cm IDS
-@@ -247,6 +263,14 @@ All files under
+@@ -258,6 +274,14 @@ All files under
  .Pa /var/db/freebsd-update/
  may be deleted if an upgrade is not in progress and rollback will not be
  required.
@@ -916,10 +1259,10 @@ index 08cf512ce..fc0c22e68 100644
 +# bootloaders manually or use a custom boot configuration.
 +# UpdateBootloader yes
 diff --git a/usr.sbin/freebsd-update/freebsd-update.sh b/usr.sbin/freebsd-update/freebsd-update.sh
-index 5d52eb285..bddfe7178 100644
+index a932cdb26..bd2affa30 100644
 --- a/usr.sbin/freebsd-update/freebsd-update.sh
 +++ b/usr.sbin/freebsd-update/freebsd-update.sh
-@@ -97,7 +97,8 @@ EOF
+@@ -98,7 +98,8 @@ EOF
  CONFIGOPTIONS="KEYPRINT WORKDIR SERVERNAME MAILTO ALLOWADD ALLOWDELETE
      KEEPMODIFIEDMETADATA COMPONENTS IGNOREPATHS UPDATEIFUNMODIFIED
      BASEDIR VERBOSELEVEL TARGETRELEASE STRICTCOMPONENTS MERGECHANGES
@@ -929,7 +1272,7 @@ index 5d52eb285..bddfe7178 100644
  
  # Set all the configuration options to "".
  nullconfig () {
-@@ -439,6 +440,24 @@ config_CreateBootEnv () {
+@@ -440,6 +441,24 @@ config_CreateBootEnv () {
  		return 1
  	fi
  }
@@ -954,7 +1297,7 @@ index 5d52eb285..bddfe7178 100644
  # Handle one line of configuration
  configline () {
  	if [ $# -eq 0 ]; then
-@@ -620,6 +639,7 @@ default_params () {
+@@ -621,6 +640,7 @@ default_params () {
  	config_BackupKernelDir /boot/kernel.old
  	config_BackupKernelSymbolFiles no
  	config_CreateBootEnv yes
@@ -962,7 +1305,7 @@ index 5d52eb285..bddfe7178 100644
  
  	# Merge these defaults into the earlier-configured settings
  	mergeconfig
-@@ -3194,6 +3214,28 @@ install_setup_rollback () {
+@@ -3252,6 +3272,28 @@ install_setup_rollback () {
  }
  
  # Actually install updates
@@ -991,7 +1334,7 @@ index 5d52eb285..bddfe7178 100644
  install_run () {
  	echo -n "Installing updates..."
  
-@@ -3212,6 +3254,10 @@ install_run () {
+@@ -3270,6 +3312,10 @@ install_run () {
  	install_setup_rollback
  
  	echo " done."

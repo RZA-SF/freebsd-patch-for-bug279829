@@ -33,7 +33,7 @@ export EFI_LOADER_SRC
 _LOADER_SIZE=524288   # 512 KiB
 _REQUIRED_KB=1088     # (512*2 + 64) KiB
 
-tap_begin 5
+tap_begin 6
 
 # Test 1: plenty of space -> returns 0
 # avail = 10240 KiB = 10 MiB, well above required 1088 KiB
@@ -63,6 +63,13 @@ assert_false "stat fails -> returns 1" efi_check_space "/boot/efi"
 mock_cmd stat "echo ${_LOADER_SIZE}"
 mock_cmd_fail df 1
 assert_false "df fails -> returns 1" efi_check_space "/boot/efi"
+
+# Test 6: dry-run mode -> always returns 0; df is never consulted
+EFI_DRY_RUN=1
+mock_cmd stat "echo ${_LOADER_SIZE}"
+mock_cmd_fail df 1   # df would fail if called, confirming it is skipped
+assert_true "dry-run: space check skipped, returns 0" efi_check_space "/boot/efi"
+EFI_DRY_RUN=0
 
 tap_end
 

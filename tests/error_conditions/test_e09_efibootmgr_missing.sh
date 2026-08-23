@@ -35,14 +35,11 @@ mock_cmd sysctl '
 case "$*" in
     *security.jail.jailed*) echo "0" ;;
     *machdep.bootmethod*)   echo "UEFI" ;;
+    *kern.disks*)           echo "nda0" ;;
     *) echo "0" ;;
 esac'
 mock_cmd_output uname "amd64"
-mock_cmd mount '
-case "$*" in
-    *msdosfs*) exit 0 ;;
-    *) printf "zroot on / type zfs (local)\n" ;;
-esac'
+mock_cmd mount 'printf "{\"mount\":{\"mounted\":[{\"special\":\"zroot/ROOT/default\",\"node\":\"/\",\"fstype\":\"zfs\",\"opts\":[\"rw\",\"noatime\"]}]}}\n"'
 mock_cmd_output zfs "zroot"
 mock_cmd zpool '
 cat <<ZPS
@@ -72,13 +69,24 @@ mock_cmd strings 'grep -a "." "$@" 2>/dev/null || true'
 mock_cmd_output sync ""
 mock_cmd stat 'echo "512"'
 
-# Do NOT create an efibootmgr mock — it is absent from PATH entirely.
-# The MOCK_BIN directory is in PATH, but no efibootmgr script is placed there.
-# 'command -v efibootmgr' will therefore fail, triggering the non-fatal path.
+# Restrict PATH so efibootmgr is not found.  On FreeBSD 14+ efibootmgr is a
+# base system binary at /usr/sbin/efibootmgr; on older systems or when
+# installed via pkg it lives at /usr/local/sbin/efibootmgr.  Restricting to
+# /bin and /usr/bin excludes both locations.  All FreeBSD system commands used
+# by the real code paths (gpart, sysctl, mount, zfs, zpool, etc.) are mocked
+# in MOCK_BIN; POSIX utilities (find, awk, sed, tr, sort, cp, mv, rm, etc.)
+# are in /bin or /usr/bin on FreeBSD.
+_saved_path="${PATH}"
+PATH="${MOCK_BIN}:/bin:/usr/bin"
+hash -r 2>/dev/null || true
 
 # --- Source script ---
 unset _EFI_BOOTLOADER_UPDATE_SH
 . "${SRC_DIR}/efi_bootloader_update.sh"
+# Simulate EFIRT present so the EFIRT check does not short-circuit before
+# the efibootmgr availability check.
+_EFI_DEV_EFI=/dev/null
+export _EFI_DEV_EFI
 
 # --- Run and capture stderr ---
 _stderr=$(update_bootloaders 2>&1 >/dev/null)
@@ -107,6 +115,8 @@ assert_eq \
     "${_efibm_calls}" "0"
 
 # --- Cleanup ---
+PATH="${_saved_path}"
+hash -r 2>/dev/null || true
 mock_cleanup
 teardown_test_dir
 

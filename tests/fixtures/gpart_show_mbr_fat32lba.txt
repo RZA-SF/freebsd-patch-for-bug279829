@@ -1,0 +1,5 @@
+=>       63  15523777  mmcsd0  MBR  (7.4G)
+         63    204800       1  !12  (100M)
+     204863  15318977       2  freebsd  (7.3G)
+
+errors: No known data errors

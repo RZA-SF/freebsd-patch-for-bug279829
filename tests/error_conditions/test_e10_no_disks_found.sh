@@ -1,9 +1,9 @@
 #!/bin/sh
 # test_e10_no_disks_found.sh
 #
-# Error condition: disk discovery fails completely — zfs command fails and
-# /etc/fstab cannot be read (or has no usable root entry).
-# efi_discover_boot_disks must return 1.
+# Error condition: disk discovery fails completely — sysctl kern.disks
+# returns an error.
+# efi_discover_all_esps must return non-zero.
 # update_bootloaders must return 0 (warns but is non-fatal per design).
 
 TESTS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,22 +26,21 @@ mock_cmd sysctl '
 case "$*" in
     *security.jail.jailed*) echo "0" ;;
     *machdep.bootmethod*)   echo "UEFI" ;;
+    *kern.disks*)           exit 1 ;;
     *) echo "0" ;;
 esac'
 mock_cmd_output uname "amd64"
 
-# mount: root is zfs (so efi_zfs_boot_disks path is taken)
-mock_cmd mount '
-case "$*" in
-    *msdosfs*) exit 0 ;;
-    *) printf "zroot on / type zfs (local)\n" ;;
-esac'
+mock_cmd mount 'printf "{\"mount\":{\"mounted\":[{\"special\":\"zroot/ROOT/default\",\"node\":\"/\",\"fstype\":\"zfs\",\"opts\":[\"rw\",\"noatime\"]}]}}\n"'
 
-# zfs fails to determine the pool name
-mock_cmd_fail zfs 1
-
-# zpool also fails
+# zpool fails — efi_root_disks cannot determine root disks
 mock_cmd_fail zpool 1
+
+# efibootmgr not present — efi_boot_esps falls back to root_disks (which also fails)
+mock_cmd_fail efibootmgr 127
+
+# gpart must not be called (no candidate disks found)
+mock_cmd_fail gpart 1
 
 # mount_msdosfs must not be called
 mock_cmd_fail mount_msdosfs 1
@@ -53,18 +52,13 @@ mock_cmd stat 'echo "512"'
 unset _EFI_BOOTLOADER_UPDATE_SH
 . "${SRC_DIR}/efi_bootloader_update.sh"
 
-# Override efi_ufs_boot_disks to also fail (no fstab available)
-efi_ufs_boot_disks() {
-    return 1
-}
-
-# Test efi_discover_boot_disks directly
+# Test efi_discover_all_esps directly — kern.disks fails
 _discover_rc=0
-efi_discover_boot_disks 2>/dev/null || _discover_rc=$?
+efi_discover_all_esps 2>/dev/null || _discover_rc=$?
 
-assert_eq \
-    "efi_discover_boot_disks returns 1 when no disks found" \
-    "${_discover_rc}" "1"
+assert_ne \
+    "efi_discover_all_esps returns non-zero when kern.disks fails" \
+    "${_discover_rc}" "0"
 
 # update_bootloaders should return 0 (non-fatal warn-and-continue)
 _update_rc=99

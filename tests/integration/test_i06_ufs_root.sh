@@ -62,17 +62,14 @@ mock_cmd sysctl '
 case "$*" in
     *security.jail.jailed*) echo "0" ;;
     *machdep.bootmethod*)   echo "UEFI" ;;
+    *kern.disks*)           echo "ada0" ;;
     *) echo "0" ;;
 esac'
 
 mock_cmd_output uname "amd64"
 
 # mount: root is ufs, NOT zfs
-mock_cmd mount '
-case "$*" in
-    *msdosfs*) exit 0 ;;
-    *) printf "/dev/ada0p3 on / type ufs (local, soft-updates)\n" ;;
-esac'
+mock_cmd mount 'printf "{\"mount\":{\"mounted\":[{\"special\":\"/dev/ada0p3\",\"node\":\"/\",\"fstype\":\"ufs\",\"opts\":[\"rw\",\"noatime\"]}]}}\n"'
 
 # zfs and zpool should NOT be relied upon for UFS root; mock defensively
 mock_cmd_output zfs ""
