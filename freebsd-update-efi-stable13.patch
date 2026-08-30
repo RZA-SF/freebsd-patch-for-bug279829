@@ -1,8 +1,8 @@
 diff --git a/usr.sbin/freebsd-update/Makefile b/usr.sbin/freebsd-update/Makefile
-index ebdf1e17d..8d3c7161e 100644
+index 14e522adb1a0..2807d05f05c5 100644
 --- a/usr.sbin/freebsd-update/Makefile
 +++ b/usr.sbin/freebsd-update/Makefile
-@@ -2,4 +2,9 @@ CONFS=	freebsd-update.conf
+@@ -3,4 +3,14 @@ CONFS=	freebsd-update.conf
  SCRIPTS=freebsd-update.sh
  MAN=	freebsd-update.8
  
@@ -11,13 +11,18 @@ index ebdf1e17d..8d3c7161e 100644
 +LIBEXECDIR=	/usr/libexec
 +LIBEXECMODE=	0755
 +
++FILESGROUPS+=	LIBEXEC
++LIBEXEC=	efi_bootloader_update.sh
++LIBEXECDIR=	/usr/libexec
++LIBEXECMODE=	0755
++
  .include <bsd.prog.mk>
 diff --git a/usr.sbin/freebsd-update/efi_bootloader_update.sh b/usr.sbin/freebsd-update/efi_bootloader_update.sh
-new file mode 100755
-index 000000000..1109e0748
+new file mode 100644
+index 000000000000..6ac8ea797c89
 --- /dev/null
 +++ b/usr.sbin/freebsd-update/efi_bootloader_update.sh
-@@ -0,0 +1,1185 @@
+@@ -0,0 +1,1325 @@
 +#!/bin/sh
 +#
 +# SPDX-License-Identifier: BSD-2-Clause
@@ -50,6 +55,10 @@ index 000000000..1109e0748
 +# Path to the EFI runtime services character device.  Overridable in tests
 +# (e.g. _EFI_DEV_EFI=/dev/null to simulate EFIRT present on a non-FreeBSD host).
 +: "${_EFI_DEV_EFI:=/dev/efi}"
++
++# Directory containing geom_diskid(4) provider device nodes.  Overridable in
++# tests to point at a temporary directory populated with stub files.
++: "${_EFI_DISKID_DEV:=/dev/diskid}"
 +
 +# ============================================================
 +# LOGGING
@@ -155,6 +164,46 @@ index 000000000..1109e0748
 +# DISK AND PARTITION DISCOVERY
 +# ============================================================
 +
++# Internal helper: emit gpart partition data for a disk in line-per-field format.
++#
++# Tries "gpart show -p --libxo json" first (FreeBSD 14.x+, where --libxo is
++# available).  Falls back to "gpart show -p" text parsing on FreeBSD 13.x and
++# earlier, which do not support --libxo.  Either way the output is the same
++# set of lines that the callers' awk scripts already parse:
++#   "scheme":"GPT"   (or MBR)
++#   "index":N
++#   "type":"efi"     (or freebsd-boot, freebsd-zfs, …)
++#
++# The text-mode fallback synthesises those lines from the columnar output of
++# "gpart show -p".  With -p, the third field of each partition row is the full
++# partition device name (e.g. "nda0p1"); stripping the disk prefix and the
++# p/s separator yields the numeric index.
++_efi_gpart_show_norm() {
++    local disk="$1" out rc
++    out=$(gpart show -p --libxo json "$disk" 2>/dev/null); rc=$?
++    if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
++        printf '%s\n' "$out" | tr ',{}[]' '\n'
++        return 0
++    fi
++    # FreeBSD 13.x text-mode fallback (--libxo not supported)
++    _efi_verb "gpart --libxo unavailable for ${disk}; using text-mode fallback (FreeBSD 13.x)"
++    gpart show -p "$disk" 2>/dev/null | awk '
++        {
++            for (i = 1; i <= NF; i++)
++                if ($i == "GPT" || $i == "MBR") { scheme = $i }
++        }
++        scheme != "" && NF >= 4 && $3 ~ /[ps][0-9]+$/ {
++            name = $3; type = $4
++            sub(/^.*[ps]/, "", name); idx = name + 0
++            if (idx > 0) {
++                print "\"scheme\":\"" scheme "\""
++                print "\"index\":" idx
++                print "\"type\":\"" type "\""
++            }
++        }
++    '
++}
++
 +# Scan all disks visible to the kernel for EFI System Partitions.
 +# Outputs one "disk part_index scheme" tuple per line.
 +#
@@ -174,26 +223,30 @@ index 000000000..1109e0748
 +    local disk found=0
 +    for disk in $disks; do
 +        [ -z "$disk" ] && continue
-+        local gpart_out scheme parts
-+        gpart_out=$(gpart show "$disk" 2>/dev/null) || continue
-+
-+        # Header line: => start size device SCHEME (size)
-+        scheme=$(printf '%s\n' "$gpart_out" | awk '$1 == "=>" { print $5; exit }')
-+
-+        case "$scheme" in
-+            GPT)
-+                parts=$(printf '%s\n' "$gpart_out" | \
-+                    awk -v d="$disk" '$4 == "efi" { print d, $3, "GPT" }')
-+                ;;
-+            MBR)
-+                parts=$(printf '%s\n' "$gpart_out" | \
-+                    awk -v d="$disk" '$4 == "fat32lba" || $4 == "fat32" || $4 == "efi" || $4 == "!12" || $4 == "!ef" { print d, $3, "MBR" }')
-+                ;;
-+            *)
-+                _efi_verb "Skipping ${disk}: unrecognised partition scheme '${scheme}'"
-+                continue
-+                ;;
-+        esac
++        # _efi_gpart_show_norm emits one key:value per line (JSON on 14.x+,
++        # synthesised equivalent on 13.x).  See helper comment for details.
++        local parts
++        parts=$(_efi_gpart_show_norm "$disk" | \
++            awk -v d="$disk" '
++                /^"scheme":/ {
++                    gsub(/^"scheme":"/, ""); gsub(/"$/, ""); scheme = $0
++                }
++                /^"index":/ {
++                    gsub(/^"index":/, ""); idx = $0 + 0; type = ""
++                }
++                /^"type":/ {
++                    gsub(/^"type":"/, ""); gsub(/"$/, ""); type = $0
++                    if (idx > 0 &&
++                        ((scheme == "GPT" && type == "efi") ||
++                         (scheme == "MBR" && (type == "fat32lba" ||
++                                              type == "fat32"    ||
++                                              type == "efi"      ||
++                                              type == "!12"      ||
++                                              type == "!ef")))) {
++                        print d, idx, scheme
++                    }
++                }
++            ')
 +
 +        if [ -n "$parts" ]; then
 +            printf '%s\n' "$parts"
@@ -218,8 +271,16 @@ index 000000000..1109e0748
 +    for disk in $disks; do
 +        [ -z "$disk" ] && continue
 +        local parts
-+        parts=$(gpart show "$disk" 2>/dev/null | \
-+            awk -v d="$disk" '$4 == "freebsd-boot" { print d, $3 }') || true
++        parts=$(_efi_gpart_show_norm "$disk" | \
++            awk -v d="$disk" '
++                /^"index":/ {
++                    gsub(/^"index":/, ""); idx = $0 + 0; type = ""
++                }
++                /^"type":/ {
++                    gsub(/^"type":"/, ""); gsub(/"$/, ""); type = $0
++                    if (idx > 0 && type == "freebsd-boot") { print d, idx }
++                }
++            ') || true
 +        if [ -n "$parts" ]; then
 +            printf '%s\n' "$parts"
 +            found=1
@@ -288,13 +349,35 @@ index 000000000..1109e0748
 +                        local real
 +                        real=$(realpath "/dev/${vdev}" 2>/dev/null) || continue
 +                        case "$real" in
-+                            /dev/gpt/*|/dev/diskid/*|/dev/gptid/*)
++                            /dev/gpt/*|/dev/gptid/*)
++                                # GPT partition and gptid labels are managed by
++                                # geom_label(4) and appear in glabel(8) status.
 +                                local component
 +                                component=$(glabel status 2>/dev/null | awk \
 +                                    -v lbl="${vdev}" \
 +                                    '$1 == lbl { print $NF; exit }')
 +                                [ -n "$component" ] || continue
 +                                real="/dev/${component}"
++                                ;;
++                            /dev/diskid/*)
++                                # diskid(4) is managed by geom_diskid(4), a
++                                # separate GEOM class not present in glabel(8).
++                                # On newer kernels (including FreeBSD-CURRENT)
++                                # /dev/diskid/* is a character device node so
++                                # realpath returns the path unchanged, and
++                                # gpart list <shortname> (nda0, etc.) also
++                                # returns empty on those systems.
++                                # gpart list/show and partition device paths
++                                # accept diskid provider names directly
++                                # (e.g. /dev/diskid/DISK-abc123p1), so strip
++                                # the partition suffix and use the diskid base
++                                # name as the disk reference — no kern.disks
++                                # scan needed.
++                                local disk_lbl
++                                disk_lbl=$(printf '%s' "${vdev#diskid/}" | \
++                                    sed 's/[sp][0-9][0-9]*$//')
++                                [ -n "$disk_lbl" ] || continue
++                                real="/dev/diskid/${disk_lbl}"
 +                                ;;
 +                        esac
 +                        real="${real#/dev/}"
@@ -344,7 +427,9 @@ index 000000000..1109e0748
 +                        return 1
 +                    }
 +                    case "$real" in
-+                        /dev/gpt/*|/dev/diskid/*|/dev/gptid/*|/dev/ufs/*)
++                        /dev/gpt/*|/dev/gptid/*|/dev/ufs/*)
++                            # GPT partition, gptid, and UFS labels are managed
++                            # by geom_label(4) and appear in glabel(8) status.
 +                            local component
 +                            component=$(glabel status 2>/dev/null | awk \
 +                                -v lbl="${root_dev}" \
@@ -354,6 +439,29 @@ index 000000000..1109e0748
 +                                return 1
 +                            fi
 +                            real="/dev/${component}"
++                            ;;
++                        /dev/diskid/*)
++                            # diskid(4) is managed by geom_diskid(4), a
++                            # separate GEOM class not present in glabel(8).
++                            # On newer kernels (including FreeBSD-CURRENT)
++                            # /dev/diskid/* is a character device node so
++                            # realpath returns the path unchanged, and
++                            # gpart list <shortname> (nda0, etc.) also
++                            # returns empty on those systems.
++                            # gpart list/show and partition device paths
++                            # accept diskid provider names directly
++                            # (e.g. /dev/diskid/DISK-abc123p1), so strip
++                            # the partition suffix and use the diskid base
++                            # name as the disk reference — no kern.disks
++                            # scan needed.
++                            local disk_lbl
++                            disk_lbl=$(printf '%s' "${root_dev#diskid/}" | \
++                                sed 's/[sp][0-9][0-9]*$//')
++                            if [ -z "$disk_lbl" ]; then
++                                _efi_warn "efi_root_disks: cannot determine diskid base from /dev/${root_dev}"
++                                return 1
++                            fi
++                            real="/dev/diskid/${disk_lbl}"
 +                            ;;
 +                    esac
 +                    root_dev="${real#/dev/}"
@@ -455,6 +563,32 @@ index 000000000..1109e0748
 +"
 +            fi
 +        done
++
++        # On some FreeBSD-CURRENT systems gpart list returns empty for short
++        # disk names (nda0, ada0) but works with diskid provider names.
++        # If the kern.disks scan found nothing, also try diskid entries.
++        if [ -z "$_boot_disks" ] && [ -d "${_EFI_DISKID_DEV}" ]; then
++            local _diskid_bases
++            _diskid_bases=$(for _f in "${_EFI_DISKID_DEV}"/*; do
++                [ -e "$_f" ] || continue
++                printf '%s\n' "${_f#${_EFI_DISKID_DEV}/}" | sed 's/p[0-9][0-9]*$//'
++            done | sort -u)
++            local _dbase
++            for _dbase in $_diskid_bases; do
++                [ -z "$_dbase" ] && continue
++                local glist_out matched
++                glist_out=$(gpart list "diskid/${_dbase}" 2>/dev/null) || continue
++                matched=$(printf '%s\n' "$glist_out" | awk -v uuid="$boot_partuuid" '
++                    tolower($0) ~ "rawuuid:" {
++                        if (tolower($NF) == tolower(uuid)) { print "yes"; exit }
++                    }
++                ')
++                if [ "$matched" = "yes" ]; then
++                    _boot_disks="${_boot_disks}diskid/${_dbase}
++"
++                fi
++            done
++        fi
 +    fi
 +
 +    if [ -n "$_boot_disks" ]; then
@@ -511,25 +645,28 @@ index 000000000..1109e0748
 +    local disk
 +    for disk in $deduped_disks; do
 +        [ -z "$disk" ] && continue
-+        local gpart_out scheme parts
-+        gpart_out=$(gpart show "$disk" 2>/dev/null) || continue
-+
-+        scheme=$(printf '%s\n' "$gpart_out" | awk '$1 == "=>" { print $5; exit }')
-+
-+        case "$scheme" in
-+            GPT)
-+                parts=$(printf '%s\n' "$gpart_out" | \
-+                    awk -v d="$disk" '$4 == "efi" { print d, $3, "GPT" }')
-+                ;;
-+            MBR)
-+                parts=$(printf '%s\n' "$gpart_out" | \
-+                    awk -v d="$disk" '$4 == "fat32lba" || $4 == "fat32" || $4 == "efi" || $4 == "!12" || $4 == "!ef" { print d, $3, "MBR" }')
-+                ;;
-+            *)
-+                _efi_verb "efi_boot_esps: skipping ${disk}: unrecognised scheme '${scheme}'"
-+                continue
-+                ;;
-+        esac
++        local parts
++        parts=$(_efi_gpart_show_norm "$disk" | \
++            awk -v d="$disk" '
++                /^"scheme":/ {
++                    gsub(/^"scheme":"/, ""); gsub(/"$/, ""); scheme = $0
++                }
++                /^"index":/ {
++                    gsub(/^"index":/, ""); idx = $0 + 0; type = ""
++                }
++                /^"type":/ {
++                    gsub(/^"type":"/, ""); gsub(/"$/, ""); type = $0
++                    if (idx > 0 &&
++                        ((scheme == "GPT" && type == "efi") ||
++                         (scheme == "MBR" && (type == "fat32lba" ||
++                                              type == "fat32"    ||
++                                              type == "efi"      ||
++                                              type == "!12"      ||
++                                              type == "!ef")))) {
++                        print d, idx, scheme
++                    }
++                }
++            ')
 +
 +        if [ -n "$parts" ]; then
 +            printf '%s\n' "$parts"
@@ -565,8 +702,16 @@ index 000000000..1109e0748
 +    for disk in $root_disks; do
 +        [ -z "$disk" ] && continue
 +        local parts
-+        parts=$(gpart show "$disk" 2>/dev/null | \
-+            awk -v d="$disk" '$4 == "freebsd-boot" { print d, $3 }') || true
++        parts=$(_efi_gpart_show_norm "$disk" | \
++            awk -v d="$disk" '
++                /^"index":/ {
++                    gsub(/^"index":/, ""); idx = $0 + 0; type = ""
++                }
++                /^"type":/ {
++                    gsub(/^"type":"/, ""); gsub(/"$/, ""); type = $0
++                    if (idx > 0 && type == "freebsd-boot") { print d, idx }
++                }
++            ') || true
 +        if [ -n "$parts" ]; then
 +            printf '%s\n' "$parts"
 +            found=1
@@ -1204,10 +1349,10 @@ index 000000000..1109e0748
 +    exit $?
 +fi
 diff --git a/usr.sbin/freebsd-update/freebsd-update.8 b/usr.sbin/freebsd-update/freebsd-update.8
-index cdb4915f7..1330acb28 100644
+index 024185198342..f58d4b450d24 100644
 --- a/usr.sbin/freebsd-update/freebsd-update.8
 +++ b/usr.sbin/freebsd-update/freebsd-update.8
-@@ -203,6 +203,22 @@ Install the most recently fetched updates or upgrade.
+@@ -192,6 +192,38 @@ Install the most recently fetched updates or upgrade.
  Returns exit code 2 if there are no updates to install and the
  .Cm fetch
  command wasn't passed as an earlier argument in the same invocation.
@@ -1227,13 +1372,37 @@ index cdb4915f7..1330acb28 100644
 +.Cm UpdateBootloader no
 +in
 +.Xr freebsd-update.conf 5 .
++.Pp
++After installing updates,
++.Nm
++automatically updates the EFI bootloader on the EFI System Partition (ESP)
++and the BIOS bootcode on
++.Xr gpart 8
++.Dq freebsd-boot
++partitions.
++This ensures the firmware-facing bootloader is consistent with the newly
++installed
++.Pa /boot/loader.efi
++and Lua scripts, preventing boot failures after major version upgrades.
++To disable, set
++.Cm UpdateBootloader no
++in
++.Xr freebsd-update.conf 5 .
  .It Cm rollback
  Uninstall the most recently installed updates.
  .It Cm IDS
-@@ -258,6 +274,14 @@ All files under
+@@ -247,6 +279,22 @@ All files under
  .Pa /var/db/freebsd-update/
  may be deleted if an upgrade is not in progress and rollback will not be
  required.
++.It Pa /usr/libexec/efi_bootloader_update.sh
++EFI and BIOS bootloader update library, sourced by
++.Nm
++during
++.Cm install
++to update bootloaders on the ESP and
++.Dq freebsd-boot
++partitions.
 +.It Pa /usr/libexec/efi_bootloader_update.sh
 +EFI and BIOS bootloader update library, sourced by
 +.Nm
@@ -1246,10 +1415,10 @@ index cdb4915f7..1330acb28 100644
  .Sh SEE ALSO
  .Xr freebsd-version 1 ,
 diff --git a/usr.sbin/freebsd-update/freebsd-update.conf b/usr.sbin/freebsd-update/freebsd-update.conf
-index 08cf512ce..fc0c22e68 100644
+index 08cf512ce144..a03120b337e8 100644
 --- a/usr.sbin/freebsd-update/freebsd-update.conf
 +++ b/usr.sbin/freebsd-update/freebsd-update.conf
-@@ -76,3 +76,8 @@ MergeChanges /etc/ /boot/device.hints
+@@ -76,3 +76,13 @@ MergeChanges /etc/ /boot/device.hints
  
  # Create a new boot environment when installing patches
  # CreateBootEnv yes
@@ -1258,11 +1427,16 @@ index 08cf512ce..fc0c22e68 100644
 +# freebsd-boot partitions when installing updates.  Disable only if you manage
 +# bootloaders manually or use a custom boot configuration.
 +# UpdateBootloader yes
++
++# Automatically update the EFI bootloader on the ESP and BIOS bootcode on
++# freebsd-boot partitions when installing updates.  Disable only if you manage
++# bootloaders manually or use a custom boot configuration.
++# UpdateBootloader yes
 diff --git a/usr.sbin/freebsd-update/freebsd-update.sh b/usr.sbin/freebsd-update/freebsd-update.sh
-index a932cdb26..bd2affa30 100644
+index 29322e864068..d405922ed3b6 100644
 --- a/usr.sbin/freebsd-update/freebsd-update.sh
 +++ b/usr.sbin/freebsd-update/freebsd-update.sh
-@@ -98,7 +98,8 @@ EOF
+@@ -97,7 +97,8 @@ EOF
  CONFIGOPTIONS="KEYPRINT WORKDIR SERVERNAME MAILTO ALLOWADD ALLOWDELETE
      KEEPMODIFIEDMETADATA COMPONENTS IGNOREPATHS UPDATEIFUNMODIFIED
      BASEDIR VERBOSELEVEL TARGETRELEASE STRICTCOMPONENTS MERGECHANGES
@@ -1272,7 +1446,7 @@ index a932cdb26..bd2affa30 100644
  
  # Set all the configuration options to "".
  nullconfig () {
-@@ -440,6 +441,24 @@ config_CreateBootEnv () {
+@@ -439,6 +440,42 @@ config_CreateBootEnv () {
  		return 1
  	fi
  }
@@ -1294,18 +1468,37 @@ index a932cdb26..bd2affa30 100644
 +	fi
 +}
 +
++config_UpdateBootloader () {
++	if [ -z ${UPDATEBOOTLOADER} ]; then
++		case $1 in
++		[Yy][Ee][Ss])
++			UPDATEBOOTLOADER=yes
++			;;
++		[Nn][Oo])
++			UPDATEBOOTLOADER=no
++			;;
++		*)
++			return 1
++			;;
++		esac
++	else
++		return 1
++	fi
++}
++
  # Handle one line of configuration
  configline () {
  	if [ $# -eq 0 ]; then
-@@ -621,6 +640,7 @@ default_params () {
+@@ -620,6 +657,8 @@ default_params () {
  	config_BackupKernelDir /boot/kernel.old
  	config_BackupKernelSymbolFiles no
  	config_CreateBootEnv yes
 +	config_UpdateBootloader yes
++	config_UpdateBootloader yes
  
  	# Merge these defaults into the earlier-configured settings
  	mergeconfig
-@@ -3252,6 +3272,28 @@ install_setup_rollback () {
+@@ -3179,6 +3218,50 @@ install_setup_rollback () {
  }
  
  # Actually install updates
@@ -1331,13 +1524,39 @@ index a932cdb26..bd2affa30 100644
 +	unset _efi_lib
 +}
 +
++# Update EFI and BIOS bootloaders after the new world/kernel is installed.
++# Sources /usr/libexec/efi_bootloader_update.sh to allow independent testing.
++# Controlled by UpdateBootloader in freebsd-update.conf (default: yes).
++update_bootloaders_after_install () {
++	if [ "${UPDATEBOOTLOADER}" = "no" ]; then
++		return 0
++	fi
++
++	_efi_lib="${BASEDIR}/usr/libexec/efi_bootloader_update.sh"
++
++	if [ ! -f "${_efi_lib}" ]; then
++		echo "freebsd-update: WARNING: ${_efi_lib} not found" \
++		    "-- bootloader not automatically updated" >&2
++		return 0
++	fi
++
++	# shellcheck source=/usr/libexec/efi_bootloader_update.sh
++	. "${_efi_lib}"
++	update_bootloaders || true   # warnings already printed; never block install
++	unset _efi_lib
++}
++
  install_run () {
  	echo -n "Installing updates..."
  
-@@ -3270,6 +3312,10 @@ install_run () {
+@@ -3197,6 +3280,14 @@ install_run () {
  	install_setup_rollback
  
  	echo " done."
++
++	# Update EFI and BIOS bootloaders now that new world/kernel is in place.
++	# Runs after install_files so /boot/loader.efi is already updated.
++	update_bootloaders_after_install
 +
 +	# Update EFI and BIOS bootloaders now that new world/kernel is in place.
 +	# Runs after install_files so /boot/loader.efi is already updated.

@@ -6,7 +6,10 @@
 # Both ZFS and UFS paths resolve GEOM label aliases (gpt/, diskid/, gptid/, ufs/) via realpath.
 # mount --libxo json uses "special" for the source device on all supported FreeBSD versions.
 #
-# 25 assertions
+# 28 assertions
+#
+# R-16 note: diskid/ vdevs and root devices are now returned as "diskid/DISK-xxx"
+# directly — no kern.disks UUID scan needed.  Tests 27-29 validate this.
 
 TESTS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "${TESTS_DIR}/lib/test_helpers.sh"
@@ -27,7 +30,7 @@ export EFI_LOADER_SRC
 
 . "${SRC_DIR}/efi_bootloader_update.sh"
 
-tap_begin 25
+tap_begin 28
 
 # ── ZFS cases ─────────────────────────────────────────────────────────────────
 
@@ -268,6 +271,64 @@ mock_cmd realpath 'echo "/dev/da0s2a"'
 mock_cmd mount 'printf "{\"mount\":{\"mounted\":[{\"special\":\"/dev/ufs/rootfs\",\"node\":\"/\",\"fstype\":\"ufs\",\"opts\":[\"rw\"]}]}}\n"'
 _result="$(efi_root_disks ufs 2>/dev/null)"
 assert_eq "UFS ufs/rootfs: realpath resolves to da0s2a, sed strips s2a -> da0" "${_result}" "da0"
+
+# ── R-16: diskid vdev/device — use diskid provider name directly ─────────────
+# geom_diskid(4) labels do not appear in glabel(8) status.  When realpath(1)
+# returns a /dev/diskid/* path unchanged (device node on newer kernels), the
+# code strips the partition suffix and returns the diskid provider base name
+# directly (e.g. "diskid/DISK-abc123").  gpart list/show and partition device
+# paths (/dev/diskid/DISK-abc123p1) accept diskid names on all FreeBSD versions.
+# No kern.disks UUID scan is needed.
+
+# Test 27: ZFS diskid vdev without partition suffix — realpath unchanged →
+# returns diskid provider name "diskid/DISK-abc123" directly.
+mock_cmd realpath 'echo "/dev/diskid/DISK-abc123"'
+mock_cmd mount 'printf "{\"mount\":{\"mounted\":[{\"special\":\"zroot/ROOT/default\",\"node\":\"/\",\"fstype\":\"zfs\",\"opts\":[\"rw\"]}]}}\n"'
+mock_cmd zpool '
+cat <<ZPS
+  pool: zroot
+ state: ONLINE
+config:
+
+	NAME                   STATE     READ WRITE CKSUM
+	zroot                  ONLINE       0     0     0
+	  diskid/DISK-abc123   ONLINE       0     0     0
+
+errors: No known data errors
+ZPS'
+_result="$(efi_root_disks zfs 2>/dev/null)"
+assert_eq "ZFS diskid: realpath unchanged, returns diskid/DISK-abc123 directly" "${_result}" "diskid/DISK-abc123"
+
+# Test 28: UFS diskid root device — realpath unchanged, partition suffix
+# stripped from p3.  Returns "diskid/DISK-abc123".
+mock_cmd realpath 'echo "/dev/diskid/DISK-abc123p3"'
+mock_cmd mount 'printf "{\"mount\":{\"mounted\":[{\"special\":\"/dev/diskid/DISK-abc123p3\",\"node\":\"/\",\"fstype\":\"ufs\",\"opts\":[\"rw\"]}]}}\n"'
+_result="$(efi_root_disks ufs 2>/dev/null)"
+assert_eq "UFS diskid: realpath unchanged, partition suffix stripped → diskid/DISK-abc123" "${_result}" "diskid/DISK-abc123"
+
+# Test 29: ZFS diskid vdev WITH partition suffix (Stefan's FreeBSD-CURRENT
+# topology: vdev = diskid/DISK-8ESKFxxxp2).  gpart list of short disk name
+# (nda0) returns empty — R-16 must not call it.  Returns "diskid/DISK-abc123".
+mock_cmd realpath 'echo "/dev/diskid/DISK-abc123p2"'
+mock_cmd gpart 'case "$*" in
+    *"list nda0"*) : ;;   # empty — simulates FreeBSD-CURRENT behaviour
+esac'
+mock_cmd sysctl 'case "$*" in *kern.disks*) echo "nda0" ;; *) echo "0" ;; esac'
+mock_cmd mount 'printf "{\"mount\":{\"mounted\":[{\"special\":\"zroot/ROOT/default\",\"node\":\"/\",\"fstype\":\"zfs\",\"opts\":[\"rw\"]}]}}\n"'
+mock_cmd zpool '
+cat <<ZPS
+  pool: zroot
+ state: ONLINE
+config:
+
+	NAME                     STATE     READ WRITE CKSUM
+	zroot                    ONLINE       0     0     0
+	  diskid/DISK-abc123p2   ONLINE       0     0     0
+
+errors: No known data errors
+ZPS'
+_result="$(efi_root_disks zfs 2>/dev/null)"
+assert_eq "ZFS diskid p2 suffix (Stefan topology): R-16 returns diskid/DISK-abc123 without gpart list" "${_result}" "diskid/DISK-abc123"
 
 tap_end
 

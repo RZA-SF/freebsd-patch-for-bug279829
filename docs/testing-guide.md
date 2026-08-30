@@ -24,10 +24,10 @@ Tests are organized into three suites:
 
 ---
 
-## 2. Running Tests on Linux (Development)
+## 2. Running Tests on Linux
 
-Linux is the recommended development platform because the test suite is
-designed to run without FreeBSD-specific kernel modules or device nodes.
+The test suite is designed to run without FreeBSD-specific kernel modules or
+device nodes, so it can be run on Linux as well as FreeBSD.
 
 ### 2.1 Prerequisites
 
@@ -64,10 +64,10 @@ ok 2 - EFI/FreeBSD/loader.efi created in fake mountpoint
 ==============================
   Test Run Complete
 ==============================
-  Files run:  25
+  Files run:  43
   Files failed: 0
-  Total tests: 130
-  Passed:  130
+  Total tests: 291
+  Passed:  291
   Failed:  0
   Skipped: 0
 ==============================

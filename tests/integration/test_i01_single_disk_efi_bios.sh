@@ -83,11 +83,7 @@ case "$*" in
         exit 0
         ;;
     *show*nda0*)
-        printf "=>       40  976773095  nda0  GPT  (466G)\n"
-        printf "         40     409600     1  efi  (200M)\n"
-        printf "     409640       1024     2  freebsd-boot  (512K)\n"
-        printf "     410664    8388608     3  freebsd-swap  (4.0G)\n"
-        printf "    8799272  967973820     4  freebsd-zfs  (462G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"200M\"},{\"index\":2,\"type\":\"freebsd-boot\",\"label\":\"\",\"rawtype\":\"83bd6b9d-7f41-11dc-be0b-001560b84f0f\",\"size\":\"512K\"},{\"index\":3,\"type\":\"freebsd-swap\",\"label\":\"\",\"rawtype\":\"516e7cb5-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"4.0G\"},{\"index\":4,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"462G\"}]}]}\n"
         ;;
     *)
         exit 1

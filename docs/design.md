@@ -247,11 +247,19 @@ The root filesystem disk(s) are determined from the running system:
   Vdev names that are GEOM aliases (`gpt/OptBzfs`, `diskid/...`, `gptid/...`)
   are resolved to real device paths.  `realpath /dev/<alias>` is tried first;
   if the path is unchanged (GEOM device node rather than a devfs symlink, as on
-  newer kernels), `glabel status` is used to find the backing partition.
+  newer kernels), a class-specific fallback resolves the backing device:
+  `gpt/` and `gptid/` labels are managed by `geom_label(4)` and resolved via
+  `glabel status`; `diskid/` labels are managed by `geom_diskid(4)` (a separate
+  GEOM class, not enumerated by `glabel status`) and resolved by comparing
+  rawuuids: `gpart list diskid/DISK-xxx` retrieves a partition UUID, then
+  all rawuuids of each `sysctl -n kern.disks` entry are scanned with
+  `gpart list $d` until a case-insensitive match is found.
 - **UFS:** `mount --libxo json` returns the root device.  GEOM label paths
   (`gpt/PBaseUFS`, `diskid/DISK-xxx-partN`) are resolved before stripping the
-  partition suffix.  As with ZFS, `realpath` is tried first and `glabel status`
-  is used as a fallback when `realpath` returns the path unchanged.
+  partition suffix.  `realpath` is tried first; the same class-specific fallback
+  applies: `glabel status` for `gpt/`/`gptid/`/`ufs/` labels; rawuuid
+  cross-reference (`gpart list diskid/DISK-xxx` → `kern.disks` scan) for
+  `diskid/` labels (partition suffix stripped before the lookup).
 
 **Split-media guard (overlap check):**
 When BootCurrent identifies one or more boot disks, `efi_boot_esps` checks
@@ -304,12 +312,19 @@ diagnostic use) but are not called by `update_bootloaders` in production.
 
 #### Partition type detection
 
-After `gpart show`, the partition scheme is read from the header line (`$5`):
+The internal helper `_efi_gpart_show_norm` is used for partition discovery.
+On FreeBSD 14.x+ it calls `gpart show -p --libxo json <disk>`; on FreeBSD
+13.x (which does not support `--libxo`) it falls back to `gpart show -p`
+text parsing, synthesising the same line-per-field output.  The `-p` flag
+causes the partition index to appear as a JSON integer (`"index":N`) rather
+than a provider name (`"name":"nda0p1"`).  JSON output is split on structural
+characters via `tr ',{}[]' '\n'` so each field lands on its own line for
+plain awk extraction.  See §6.9 for full details.
 
-- **GPT** disks: ESP identified by partition type `efi`.
-- **MBR** disks: ESP identified by gpart type names `fat32lba` (0x0C),
-  `fat32` (0x0B), or `efi` (0xEF).  The legacy hex forms `!12`/`!ef` are
-  also accepted as a fallback; gpart uses symbolic names for known types.
+- **GPT** disks: ESP identified by `"scheme":"GPT"` and `"type":"efi"`.
+- **MBR** disks: ESP identified by `"scheme":"MBR"` and type one of
+  `fat32lba` (0x0C), `fat32` (0x0B), `efi` (0xEF), or the legacy hex
+  forms `!12`/`!ef`.
 
 Device paths are constructed accordingly:
 - GPT: `/dev/<disk>p<index>` (e.g. `/dev/nda0p1`)
@@ -320,10 +335,10 @@ the `freebsd-boot` type is a GPT-specific FreeBSD invention.
 
 #### GPT label annotations
 
-`gpart show` may include a `[label]` annotation after the partition type field
-when a GPT label is set (e.g. `1  efi  [efi0]  (200M)`).  The `awk` field
-positions `$3` (index) and `$4` (type) remain stable regardless of whether a
-label annotation is present, so no special handling is required.
+When a GPT label is set, `gpart show -p --libxo json` emits the label as a
+separate `"label":"efi0"` field.  Because named JSON fields are extracted
+independently (not by column position), the label field does not affect
+scheme or type parsing.
 
 ### 4.2 Loader Fingerprinting
 
@@ -513,8 +528,9 @@ not required, and the resolution works for any label value.
 | Two FreeBSD installs, separate disks | UEFI | ZFS | 2 | Only current system's ESPs updated (BootCurrent + root-disk union) |
 | ESP on different disk than zpool | UEFI | ZFS | 2 | BootCurrent PARTUUID match identifies ESP disk independently of pool members |
 | Split-media/dedicated boot disk (BootCurrent disk ∉ root disks) | UEFI | ZFS or UFS | 2 | R-14 guard: only BootCurrent disk updated; root disks excluded from candidates |
-| diskid/gptid/gpt-label vdev names in zpool | UEFI | ZFS | 1+ | `realpath /dev/<alias>` tried first; `glabel status` fallback when path is a GEOM device node |
+| diskid/gptid/gpt-label vdev names in zpool | UEFI | ZFS | 1+ | `realpath /dev/<alias>` tried first; `glabel status` for `gpt/`/`gptid/` device nodes; rawuuid cross-reference via `gpart list` + `kern.disks` for `diskid/` |
 | UFS root via GPT label (`gpt/PBaseUFS`) | UEFI | UFS | 1+ | `mount --libxo json` returns geom provider name; `realpath` then `glabel status` fallback |
+| UFS root via diskid label (`diskid/DISK-xxx-partN`) | UEFI | UFS | 1+ | `realpath` returns path unchanged (device node); rawuuid cross-reference via `gpart list diskid/DISK-xxx` + `kern.disks` scan |
 | machdep.bootmethod OID absent | UEFI | any | 1+ | aarch64/armv7/riscv64 may lack this sysctl; script assumes UEFI when OID missing |
 | BootCurrent unavailable (limited firmware) | UEFI | any | 1+ | PARTUUID lookup falls through; root-disk heuristic used as sole source |
 | EFIRT absent (i386, armv7, riscv64, custom kernel) | UEFI | any | 1+ | NVRAM management skipped (graceful); ESP file updates proceed normally |
@@ -783,6 +799,82 @@ to the 64-bit fallback.  This requires handling the absent-source case
 gracefully on 13.x and non-amd64 hosts.
 
 This is tracked as open review item #2 (imp, D58990).
+
+### 6.9 `gpart show` parsing — `_efi_gpart_show_norm` (Implemented)
+
+All four `gpart show` parsing sites (`efi_discover_all_esps`,
+`efi_discover_all_bios_parts`, `efi_boot_esps` Step 5, `efi_boot_bios_parts`)
+call the internal helper `_efi_gpart_show_norm` rather than invoking
+`gpart show -p --libxo json` directly.
+
+**Why the helper exists (R-17):** `gpart --libxo` is only available on FreeBSD
+14.x and later.  FreeBSD 13.x `gpart` does not recognise `--libxo` at all and
+exits non-zero with a usage error.  This was discovered on an AWS Graviton EC2
+instance running FreeBSD 13.5-RELEASE aarch64.
+
+`_efi_gpart_show_norm` tries `gpart show -p --libxo json` first.  If that
+exits non-zero or returns empty output, it falls back to `gpart show -p`
+(text-mode) and synthesises the identical line-per-field output that the
+callers' awk scripts expect:
+
+```
+"scheme":"GPT"
+"index":1
+"type":"efi"
+"scheme":"GPT"
+"index":2
+"type":"freebsd-ufs"
+```
+
+This means the four awk parsers are unchanged; only the data source differs.
+When `EFI_VERBOSE=1`, the fallback emits a `DEBUG:` line identifying the disk
+and the reason.
+
+**FreeBSD 14.x+ (JSON path):**
+
+```sh
+gpart show -p --libxo json "$disk" 2>/dev/null | tr ',{}[]' '\n'
+```
+
+The `-p` flag is required to emit the partition index as `"index":N`
+(integer); without it, only `"name":"nda0p1"` appears.
+
+**FreeBSD 13.x text fallback:**
+
+```sh
+gpart show -p "$disk" 2>/dev/null | awk '
+    { for (i=1;i<=NF;i++) if ($i=="GPT"||$i=="MBR") scheme=$i }
+    scheme!="" && NF>=4 && $3~/[ps][0-9]+$/ {
+        name=$3; type=$4
+        sub(/^.*[ps]/,"",name); idx=name+0
+        if (idx>0) {
+            print "\"scheme\":\"" scheme "\""
+            print "\"index\":" idx
+            print "\"type\":\"" type "\""
+        }
+    }
+'
+```
+
+With `-p`, the third field of each partition row is the full device name
+(e.g. `nda0p1`); stripping the disk prefix and `p`/`s` separator yields the
+numeric index.
+
+**Callers' awk pattern (unchanged):**
+
+```sh
+_efi_gpart_show_norm "$disk" | \
+    awk -v d="$disk" '
+        /^"scheme":/ { gsub(/^"scheme":"/, ""); gsub(/"$/, ""); scheme = $0 }
+        /^"index":/  { gsub(/^"index":/,  ""); idx = $0 + 0; type = "" }
+        /^"type":/   { gsub(/^"type":"/, "");  gsub(/"$/, ""); type = $0
+                       if (idx > 0 && ...) print d, idx, scheme }
+    '
+```
+
+`type = ""` on each new `"index":` line ensures per-partition isolation.
+`idx > 0` guards against the degenerate `"index":0` case (not emitted by
+gpart in practice).
 
 ---
 

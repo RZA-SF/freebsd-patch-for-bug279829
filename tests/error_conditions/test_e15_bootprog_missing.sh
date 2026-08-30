@@ -54,9 +54,7 @@ ZPS'
 mock_cmd gpart '
 case "$*" in
     *show*ada0*)
-        printf "=>       63  976773042  ada0  GPT  (466G)\n"
-        printf "         63       1985     1  freebsd-boot  (993K)\n"
-        printf "    4196352  972576752     3  freebsd-zfs  (464G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"freebsd-boot\",\"label\":\"\",\"rawtype\":\"83bd6b9d-7f41-11dc-be0b-001560b84f0f\",\"size\":\"993K\"},{\"index\":3,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"464G\"}]}]}\n"
         ;;
     *bootcode*)
         exit 1

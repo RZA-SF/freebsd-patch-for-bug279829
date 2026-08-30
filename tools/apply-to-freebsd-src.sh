@@ -25,7 +25,7 @@ if [ -z "${FREEBSD_SRC}" ]; then
     exit 1
 fi
 
-if [ ! -d "${FREEBSD_SRC}/.git" ]; then
+if ! git -C "${FREEBSD_SRC}" rev-parse --git-dir > /dev/null 2>&1; then
     echo "Error: ${FREEBSD_SRC} does not appear to be a git repository" >&2
     exit 1
 fi

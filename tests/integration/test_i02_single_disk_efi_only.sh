@@ -70,9 +70,7 @@ ZPS'
 mock_cmd gpart '
 case "$*" in
     *show*nvd0*)
-        printf "=>       40  976773095  nvd0  GPT  (466G)\n"
-        printf "         40     409600     1  efi  (200M)\n"
-        printf "     409640  976363456     2  freebsd-zfs  (465G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"200M\"},{\"index\":2,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"465G\"}]}]}\n"
         ;;
     *bootcode*)
         # Should not be reached in this test

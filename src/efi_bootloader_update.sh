@@ -31,6 +31,10 @@ _EFI_FINGERPRINT_THRESHOLD=2
 # (e.g. _EFI_DEV_EFI=/dev/null to simulate EFIRT present on a non-FreeBSD host).
 : "${_EFI_DEV_EFI:=/dev/efi}"
 
+# Directory containing geom_diskid(4) provider device nodes.  Overridable in
+# tests to point at a temporary directory populated with stub files.
+: "${_EFI_DISKID_DEV:=/dev/diskid}"
+
 # ============================================================
 # LOGGING
 # ============================================================
@@ -135,6 +139,46 @@ efi_root_fs_type() {
 # DISK AND PARTITION DISCOVERY
 # ============================================================
 
+# Internal helper: emit gpart partition data for a disk in line-per-field format.
+#
+# Tries "gpart show -p --libxo json" first (FreeBSD 14.x+, where --libxo is
+# available).  Falls back to "gpart show -p" text parsing on FreeBSD 13.x and
+# earlier, which do not support --libxo.  Either way the output is the same
+# set of lines that the callers' awk scripts already parse:
+#   "scheme":"GPT"   (or MBR)
+#   "index":N
+#   "type":"efi"     (or freebsd-boot, freebsd-zfs, …)
+#
+# The text-mode fallback synthesises those lines from the columnar output of
+# "gpart show -p".  With -p, the third field of each partition row is the full
+# partition device name (e.g. "nda0p1"); stripping the disk prefix and the
+# p/s separator yields the numeric index.
+_efi_gpart_show_norm() {
+    local disk="$1" out rc
+    out=$(gpart show -p --libxo json "$disk" 2>/dev/null); rc=$?
+    if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
+        printf '%s\n' "$out" | tr ',{}[]' '\n'
+        return 0
+    fi
+    # FreeBSD 13.x text-mode fallback (--libxo not supported)
+    _efi_verb "gpart --libxo unavailable for ${disk}; using text-mode fallback (FreeBSD 13.x)"
+    gpart show -p "$disk" 2>/dev/null | awk '
+        {
+            for (i = 1; i <= NF; i++)
+                if ($i == "GPT" || $i == "MBR") { scheme = $i }
+        }
+        scheme != "" && NF >= 4 && $3 ~ /[ps][0-9]+$/ {
+            name = $3; type = $4
+            sub(/^.*[ps]/, "", name); idx = name + 0
+            if (idx > 0) {
+                print "\"scheme\":\"" scheme "\""
+                print "\"index\":" idx
+                print "\"type\":\"" type "\""
+            }
+        }
+    '
+}
+
 # Scan all disks visible to the kernel for EFI System Partitions.
 # Outputs one "disk part_index scheme" tuple per line.
 #
@@ -154,26 +198,30 @@ efi_discover_all_esps() {
     local disk found=0
     for disk in $disks; do
         [ -z "$disk" ] && continue
-        local gpart_out scheme parts
-        gpart_out=$(gpart show "$disk" 2>/dev/null) || continue
-
-        # Header line: => start size device SCHEME (size)
-        scheme=$(printf '%s\n' "$gpart_out" | awk '$1 == "=>" { print $5; exit }')
-
-        case "$scheme" in
-            GPT)
-                parts=$(printf '%s\n' "$gpart_out" | \
-                    awk -v d="$disk" '$4 == "efi" { print d, $3, "GPT" }')
-                ;;
-            MBR)
-                parts=$(printf '%s\n' "$gpart_out" | \
-                    awk -v d="$disk" '$4 == "fat32lba" || $4 == "fat32" || $4 == "efi" || $4 == "!12" || $4 == "!ef" { print d, $3, "MBR" }')
-                ;;
-            *)
-                _efi_verb "Skipping ${disk}: unrecognised partition scheme '${scheme}'"
-                continue
-                ;;
-        esac
+        # _efi_gpart_show_norm emits one key:value per line (JSON on 14.x+,
+        # synthesised equivalent on 13.x).  See helper comment for details.
+        local parts
+        parts=$(_efi_gpart_show_norm "$disk" | \
+            awk -v d="$disk" '
+                /^"scheme":/ {
+                    gsub(/^"scheme":"/, ""); gsub(/"$/, ""); scheme = $0
+                }
+                /^"index":/ {
+                    gsub(/^"index":/, ""); idx = $0 + 0; type = ""
+                }
+                /^"type":/ {
+                    gsub(/^"type":"/, ""); gsub(/"$/, ""); type = $0
+                    if (idx > 0 &&
+                        ((scheme == "GPT" && type == "efi") ||
+                         (scheme == "MBR" && (type == "fat32lba" ||
+                                              type == "fat32"    ||
+                                              type == "efi"      ||
+                                              type == "!12"      ||
+                                              type == "!ef")))) {
+                        print d, idx, scheme
+                    }
+                }
+            ')
 
         if [ -n "$parts" ]; then
             printf '%s\n' "$parts"
@@ -198,8 +246,16 @@ efi_discover_all_bios_parts() {
     for disk in $disks; do
         [ -z "$disk" ] && continue
         local parts
-        parts=$(gpart show "$disk" 2>/dev/null | \
-            awk -v d="$disk" '$4 == "freebsd-boot" { print d, $3 }') || true
+        parts=$(_efi_gpart_show_norm "$disk" | \
+            awk -v d="$disk" '
+                /^"index":/ {
+                    gsub(/^"index":/, ""); idx = $0 + 0; type = ""
+                }
+                /^"type":/ {
+                    gsub(/^"type":"/, ""); gsub(/"$/, ""); type = $0
+                    if (idx > 0 && type == "freebsd-boot") { print d, idx }
+                }
+            ') || true
         if [ -n "$parts" ]; then
             printf '%s\n' "$parts"
             found=1
@@ -268,13 +324,35 @@ efi_root_disks() {
                         local real
                         real=$(realpath "/dev/${vdev}" 2>/dev/null) || continue
                         case "$real" in
-                            /dev/gpt/*|/dev/diskid/*|/dev/gptid/*)
+                            /dev/gpt/*|/dev/gptid/*)
+                                # GPT partition and gptid labels are managed by
+                                # geom_label(4) and appear in glabel(8) status.
                                 local component
                                 component=$(glabel status 2>/dev/null | awk \
                                     -v lbl="${vdev}" \
                                     '$1 == lbl { print $NF; exit }')
                                 [ -n "$component" ] || continue
                                 real="/dev/${component}"
+                                ;;
+                            /dev/diskid/*)
+                                # diskid(4) is managed by geom_diskid(4), a
+                                # separate GEOM class not present in glabel(8).
+                                # On newer kernels (including FreeBSD-CURRENT)
+                                # /dev/diskid/* is a character device node so
+                                # realpath returns the path unchanged, and
+                                # gpart list <shortname> (nda0, etc.) also
+                                # returns empty on those systems.
+                                # gpart list/show and partition device paths
+                                # accept diskid provider names directly
+                                # (e.g. /dev/diskid/DISK-abc123p1), so strip
+                                # the partition suffix and use the diskid base
+                                # name as the disk reference — no kern.disks
+                                # scan needed.
+                                local disk_lbl
+                                disk_lbl=$(printf '%s' "${vdev#diskid/}" | \
+                                    sed 's/[sp][0-9][0-9]*$//')
+                                [ -n "$disk_lbl" ] || continue
+                                real="/dev/diskid/${disk_lbl}"
                                 ;;
                         esac
                         real="${real#/dev/}"
@@ -324,7 +402,9 @@ efi_root_disks() {
                         return 1
                     }
                     case "$real" in
-                        /dev/gpt/*|/dev/diskid/*|/dev/gptid/*|/dev/ufs/*)
+                        /dev/gpt/*|/dev/gptid/*|/dev/ufs/*)
+                            # GPT partition, gptid, and UFS labels are managed
+                            # by geom_label(4) and appear in glabel(8) status.
                             local component
                             component=$(glabel status 2>/dev/null | awk \
                                 -v lbl="${root_dev}" \
@@ -334,6 +414,29 @@ efi_root_disks() {
                                 return 1
                             fi
                             real="/dev/${component}"
+                            ;;
+                        /dev/diskid/*)
+                            # diskid(4) is managed by geom_diskid(4), a
+                            # separate GEOM class not present in glabel(8).
+                            # On newer kernels (including FreeBSD-CURRENT)
+                            # /dev/diskid/* is a character device node so
+                            # realpath returns the path unchanged, and
+                            # gpart list <shortname> (nda0, etc.) also
+                            # returns empty on those systems.
+                            # gpart list/show and partition device paths
+                            # accept diskid provider names directly
+                            # (e.g. /dev/diskid/DISK-abc123p1), so strip
+                            # the partition suffix and use the diskid base
+                            # name as the disk reference — no kern.disks
+                            # scan needed.
+                            local disk_lbl
+                            disk_lbl=$(printf '%s' "${root_dev#diskid/}" | \
+                                sed 's/[sp][0-9][0-9]*$//')
+                            if [ -z "$disk_lbl" ]; then
+                                _efi_warn "efi_root_disks: cannot determine diskid base from /dev/${root_dev}"
+                                return 1
+                            fi
+                            real="/dev/diskid/${disk_lbl}"
                             ;;
                     esac
                     root_dev="${real#/dev/}"
@@ -435,6 +538,32 @@ efi_boot_esps() {
 "
             fi
         done
+
+        # On some FreeBSD-CURRENT systems gpart list returns empty for short
+        # disk names (nda0, ada0) but works with diskid provider names.
+        # If the kern.disks scan found nothing, also try diskid entries.
+        if [ -z "$_boot_disks" ] && [ -d "${_EFI_DISKID_DEV}" ]; then
+            local _diskid_bases
+            _diskid_bases=$(for _f in "${_EFI_DISKID_DEV}"/*; do
+                [ -e "$_f" ] || continue
+                printf '%s\n' "${_f#${_EFI_DISKID_DEV}/}" | sed 's/p[0-9][0-9]*$//'
+            done | sort -u)
+            local _dbase
+            for _dbase in $_diskid_bases; do
+                [ -z "$_dbase" ] && continue
+                local glist_out matched
+                glist_out=$(gpart list "diskid/${_dbase}" 2>/dev/null) || continue
+                matched=$(printf '%s\n' "$glist_out" | awk -v uuid="$boot_partuuid" '
+                    tolower($0) ~ "rawuuid:" {
+                        if (tolower($NF) == tolower(uuid)) { print "yes"; exit }
+                    }
+                ')
+                if [ "$matched" = "yes" ]; then
+                    _boot_disks="${_boot_disks}diskid/${_dbase}
+"
+                fi
+            done
+        fi
     fi
 
     if [ -n "$_boot_disks" ]; then
@@ -491,25 +620,28 @@ efi_boot_esps() {
     local disk
     for disk in $deduped_disks; do
         [ -z "$disk" ] && continue
-        local gpart_out scheme parts
-        gpart_out=$(gpart show "$disk" 2>/dev/null) || continue
-
-        scheme=$(printf '%s\n' "$gpart_out" | awk '$1 == "=>" { print $5; exit }')
-
-        case "$scheme" in
-            GPT)
-                parts=$(printf '%s\n' "$gpart_out" | \
-                    awk -v d="$disk" '$4 == "efi" { print d, $3, "GPT" }')
-                ;;
-            MBR)
-                parts=$(printf '%s\n' "$gpart_out" | \
-                    awk -v d="$disk" '$4 == "fat32lba" || $4 == "fat32" || $4 == "efi" || $4 == "!12" || $4 == "!ef" { print d, $3, "MBR" }')
-                ;;
-            *)
-                _efi_verb "efi_boot_esps: skipping ${disk}: unrecognised scheme '${scheme}'"
-                continue
-                ;;
-        esac
+        local parts
+        parts=$(_efi_gpart_show_norm "$disk" | \
+            awk -v d="$disk" '
+                /^"scheme":/ {
+                    gsub(/^"scheme":"/, ""); gsub(/"$/, ""); scheme = $0
+                }
+                /^"index":/ {
+                    gsub(/^"index":/, ""); idx = $0 + 0; type = ""
+                }
+                /^"type":/ {
+                    gsub(/^"type":"/, ""); gsub(/"$/, ""); type = $0
+                    if (idx > 0 &&
+                        ((scheme == "GPT" && type == "efi") ||
+                         (scheme == "MBR" && (type == "fat32lba" ||
+                                              type == "fat32"    ||
+                                              type == "efi"      ||
+                                              type == "!12"      ||
+                                              type == "!ef")))) {
+                        print d, idx, scheme
+                    }
+                }
+            ')
 
         if [ -n "$parts" ]; then
             printf '%s\n' "$parts"
@@ -545,8 +677,16 @@ efi_boot_bios_parts() {
     for disk in $root_disks; do
         [ -z "$disk" ] && continue
         local parts
-        parts=$(gpart show "$disk" 2>/dev/null | \
-            awk -v d="$disk" '$4 == "freebsd-boot" { print d, $3 }') || true
+        parts=$(_efi_gpart_show_norm "$disk" | \
+            awk -v d="$disk" '
+                /^"index":/ {
+                    gsub(/^"index":/, ""); idx = $0 + 0; type = ""
+                }
+                /^"type":/ {
+                    gsub(/^"type":"/, ""); gsub(/"$/, ""); type = $0
+                    if (idx > 0 && type == "freebsd-boot") { print d, idx }
+                }
+            ') || true
         if [ -n "$parts" ]; then
             printf '%s\n' "$parts"
             found=1

@@ -1344,13 +1344,13 @@ index 000000000000..6ac8ea797c89
 +    exit $?
 +fi
 diff --git a/usr.sbin/freebsd-update/freebsd-update.8 b/usr.sbin/freebsd-update/freebsd-update.8
-index 024185198342..1367f5cb12ae 100644
+index 0d50ac8822de..c071446bd80b 100644
 --- a/usr.sbin/freebsd-update/freebsd-update.8
 +++ b/usr.sbin/freebsd-update/freebsd-update.8
-@@ -192,6 +192,22 @@ Install the most recently fetched updates or upgrade.
- Returns exit code 2 if there are no updates to install and the
+@@ -197,6 +197,22 @@ and the
  .Cm fetch
- command wasn't passed as an earlier argument in the same invocation.
+ command wasn't passed as an earlier argument in the same
+ invocation.
 +.Pp
 +After installing updates,
 +.Nm
@@ -1370,7 +1370,7 @@ index 024185198342..1367f5cb12ae 100644
  .It Cm rollback
  Uninstall the most recently installed updates.
  .It Cm IDS
-@@ -247,6 +263,14 @@ All files under
+@@ -256,6 +272,14 @@ All files under
  .Pa /var/db/freebsd-update/
  may be deleted if an upgrade is not in progress and rollback will not be
  required.
@@ -1399,7 +1399,7 @@ index 08cf512ce144..fc0c22e685ed 100644
 +# bootloaders manually or use a custom boot configuration.
 +# UpdateBootloader yes
 diff --git a/usr.sbin/freebsd-update/freebsd-update.sh b/usr.sbin/freebsd-update/freebsd-update.sh
-index 5d52eb285fe0..bddfe71787a4 100644
+index 438e13a51154..e65eac0c13e8 100644
 --- a/usr.sbin/freebsd-update/freebsd-update.sh
 +++ b/usr.sbin/freebsd-update/freebsd-update.sh
 @@ -97,7 +97,8 @@ EOF
@@ -1445,7 +1445,7 @@ index 5d52eb285fe0..bddfe71787a4 100644
  
  	# Merge these defaults into the earlier-configured settings
  	mergeconfig
-@@ -3194,6 +3214,28 @@ install_setup_rollback () {
+@@ -3141,6 +3161,28 @@ install_setup_rollback () {
  }
  
  # Actually install updates
@@ -1474,7 +1474,7 @@ index 5d52eb285fe0..bddfe71787a4 100644
  install_run () {
  	echo -n "Installing updates..."
  
-@@ -3212,6 +3254,10 @@ install_run () {
+@@ -3159,6 +3201,10 @@ install_run () {
  	install_setup_rollback
  
  	echo " done."

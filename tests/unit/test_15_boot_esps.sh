@@ -4,7 +4,7 @@
 # efi_boot_esps identifies EFI System Partitions belonging to the current
 # system via the union of BootCurrent NVRAM variable and root filesystem disks.
 #
-# 27 assertions
+# 28 assertions
 
 TESTS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "${TESTS_DIR}/lib/test_helpers.sh"
@@ -28,7 +28,7 @@ export EFI_LOADER_SRC
 _EFI_DEV_EFI=/dev/null
 export _EFI_DEV_EFI
 
-tap_begin 27
+tap_begin 28
 
 # Helper: gpart show for nda0 (GPT, efi at index 1)
 _gpart_show_nda0='
@@ -36,16 +36,10 @@ case "$*" in
     *list*nda0*) cat "'"${FIXTURES_DIR}/gpart_list_nda0.txt"'" ;;
     *list*nda1*) cat "'"${FIXTURES_DIR}/gpart_list_nda1.txt"'" ;;
     *show*nda0*)
-        printf "=>       40  976773095  nda0  GPT  (466G)\n"
-        printf "         40     409600     1  efi  (200M)\n"
-        printf "     409640       1024     2  freebsd-boot  (512K)\n"
-        printf "    8799272  967973820     4  freebsd-zfs  (462G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"200M\"},{\"index\":2,\"type\":\"freebsd-boot\",\"label\":\"\",\"rawtype\":\"83bd6b9d-7f41-11dc-be0b-001560b84f0f\",\"size\":\"512K\"},{\"index\":4,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"462G\"}]}]}\n"
         ;;
     *show*nda1*)
-        printf "=>       40  976773095  nda1  GPT  (466G)\n"
-        printf "         40     409600     1  efi  (200M)\n"
-        printf "     409640       1024     2  freebsd-boot  (512K)\n"
-        printf "    8799272  967973820     4  freebsd-zfs  (462G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"200M\"},{\"index\":2,\"type\":\"freebsd-boot\",\"label\":\"\",\"rawtype\":\"83bd6b9d-7f41-11dc-be0b-001560b84f0f\",\"size\":\"512K\"},{\"index\":4,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"462G\"}]}]}\n"
         ;;
     *) exit 1 ;;
 esac'
@@ -145,14 +139,10 @@ case "$*" in
         printf "1. Name: nda0p1\n   rawuuid: aaaaaaaa-0000-0000-0000-000000000000\n   type: efi\n"
         ;;
     *show*da1*)
-        printf "=>       40  976773095  da1  GPT  (466G)\n"
-        printf "         40     409600     1  efi  (200M)\n"
-        printf "     409640  976363456     2  freebsd-zfs  (465G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"200M\"},{\"index\":2,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"465G\"}]}]}\n"
         ;;
     *show*nda0*)
-        printf "=>       40  976773095  nda0  GPT  (466G)\n"
-        printf "         40     409600     1  efi  (200M)\n"
-        printf "     409640  976363456     2  freebsd-zfs  (465G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"200M\"},{\"index\":2,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"465G\"}]}]}\n"
         ;;
     *) exit 1 ;;
 esac'
@@ -194,14 +184,11 @@ case "$*" in
         printf "1. Name: nda0p1\n   rawuuid: 22223333-4444-5555-6666-777788889999\n   type: freebsd-zfs\n"
         ;;
     *show*usb0*)
-        printf "=>       40  7340032  usb0  GPT  (3.5G)\n"
-        printf "         40   204800     1  efi  (100M)\n"
-        printf "     204840  7135192     2  freebsd-zfs  (3.4G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"100M\"},{\"index\":2,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"3.4G\"}]}]}\n"
         ;;
     *show*nda0*)
         # NVMe pool disk - no ESP partition
-        printf "=>       40  976773095  nda0  GPT  (466G)\n"
-        printf "     204840  976568256     1  freebsd-zfs  (466G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"466G\"}]}]}\n"
         ;;
     *) exit 1 ;;
 esac'
@@ -227,9 +214,7 @@ mock_cmd sysctl 'case "$*" in *kern.disks*) echo "0" ;; *) echo "0" ;; esac'
 mock_cmd gpart '
 case "$*" in
     *show*mmcsd0*)
-        printf "=>       1  62333951  mmcsd0  MBR  (30G)\n"
-        printf "          1      2048     1  !12  (1.0M)\n"
-        printf "       2049  62331904     2  freebsd-ufs  (30G)\n"
+        printf "{\"PART\":[{\"scheme\":\"MBR\",\"partitions\":[{\"index\":1,\"type\":\"!12\",\"label\":\"\",\"rawtype\":\"!12\",\"size\":\"1.0M\"},{\"index\":2,\"type\":\"freebsd-ufs\",\"label\":\"\",\"rawtype\":\"!a5\",\"size\":\"30G\"}]}]}\n"
         ;;
     *) exit 1 ;;
 esac'
@@ -243,8 +228,7 @@ mock_cmd sysctl 'case "$*" in *kern.disks*) echo "0" ;; *) echo "0" ;; esac'
 mock_cmd gpart '
 case "$*" in
     *show*nda0*)
-        printf "=>       40  976773095  nda0  GPT  (466G)\n"
-        printf "     204840  976568256     1  freebsd-zfs  (466G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"466G\"}]}]}\n"
         ;;
     *) exit 1 ;;
 esac'
@@ -286,9 +270,7 @@ case "$*" in
     *list*nda0*) cat "'"${FIXTURES_DIR}/gpart_list_nda0.txt"'" ;;
     *list*cd0*)  exit 1 ;;
     *show*nda0*)
-        printf "=>       40  976773095  nda0  GPT  (466G)\n"
-        printf "         40     409600     1  efi  (200M)\n"
-        printf "     409640  976363456     2  freebsd-zfs  (465G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"200M\"},{\"index\":2,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"465G\"}]}]}\n"
         ;;
     *) exit 1 ;;
 esac'
@@ -303,10 +285,7 @@ mock_cmd sysctl 'case "$*" in *kern.disks*) echo "0" ;; *) echo "0" ;; esac'
 mock_cmd gpart '
 case "$*" in
     *show*ada0*)
-        printf "=>       40  976773095  ada0  GPT  (466G)\n"
-        printf "         40     409600     1  efi  (200M)\n"
-        printf "     409640       1024     2  freebsd-boot  (512K)\n"
-        printf "     410664  976363456     3  freebsd-ufs  (465G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"200M\"},{\"index\":2,\"type\":\"freebsd-boot\",\"label\":\"\",\"rawtype\":\"83bd6b9d-7f41-11dc-be0b-001560b84f0f\",\"size\":\"512K\"},{\"index\":3,\"type\":\"freebsd-ufs\",\"label\":\"\",\"rawtype\":\"516e7cb6-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"465G\"}]}]}\n"
         ;;
     *) exit 1 ;;
 esac'
@@ -333,14 +312,10 @@ mock_cmd sysctl 'case "$*" in *kern.disks*) echo "0" ;; *) echo "0" ;; esac'
 mock_cmd gpart '
 case "$*" in
     *show*nda0*)
-        printf "=>       40  976773095  nda0  GPT  (466G)\n"
-        printf "         40     409600     1  efi  (200M)\n"
-        printf "     409640  976363456     4  freebsd-zfs  (465G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"200M\"},{\"index\":4,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"465G\"}]}]}\n"
         ;;
     *show*nda1*)
-        printf "=>       40  976773095  nda1  GPT  (466G)\n"
-        printf "         40     409600     1  efi  (200M)\n"
-        printf "     409640  976363456     4  freebsd-zfs  (465G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"200M\"},{\"index\":4,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"465G\"}]}]}\n"
         ;;
     *) exit 1 ;;
 esac'
@@ -418,9 +393,7 @@ mock_cmd sysctl 'case "$*" in *kern.disks*) echo "0" ;; *) echo "0" ;; esac'
 mock_cmd gpart '
 case "$*" in
     *show*da0*)
-        printf "=>      63  61439937  da0  MBR  (29G)\n"
-        printf "      2048    102400    1  fat32lba  [active]  (50M)\n"
-        printf "    104448  61335552    2  freebsd  (29G)\n"
+        printf "{\"PART\":[{\"scheme\":\"MBR\",\"partitions\":[{\"index\":1,\"type\":\"fat32lba\",\"label\":\"\",\"rawtype\":\"!0c\",\"size\":\"50M\"},{\"index\":2,\"type\":\"freebsd\",\"label\":\"\",\"rawtype\":\"!a5\",\"size\":\"29G\"}]}]}\n"
         ;;
     *) exit 1 ;;
 esac'
@@ -449,14 +422,10 @@ case "$*" in
         printf "      type: efi\n"
         ;;
     *show*nda0*)
-        printf "=>       40  976773095  nda0  GPT  (466G)\n"
-        printf "         40     409600     1  efi  (200M)\n"
-        printf "    8799272  967973820     4  freebsd-zfs  (462G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"200M\"},{\"index\":4,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"462G\"}]}]}\n"
         ;;
     *show*ada0*)
-        printf "=>       40  976773095  ada0  GPT  (466G)\n"
-        printf "         40     409600     1  efi  (200M)\n"
-        printf "    8799272  967973820     4  freebsd-zfs  (462G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"200M\"},{\"index\":4,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"462G\"}]}]}\n"
         ;;
     *) exit 1 ;;
 esac'
@@ -482,6 +451,42 @@ printf "  pool: zroot\n state: ONLINE\nconfig:\n\tNAME\tSTATE\n\tzroot\tONLINE\n
 _result="$(efi_boot_esps 2>/dev/null)"
 assert_contains "Mirror+overlap: nda0 1 GPT found" "${_result}" "nda0 1 GPT"
 assert_contains "Mirror+overlap: nda1 1 GPT also found" "${_result}" "nda1 1 GPT"
+
+# ── Test 28: R-16 — diskid system, gpart list shortname returns empty ─────────
+# Simulates Stefan's FreeBSD-CURRENT topology: ZFS pool vdev diskid/DISK-abc123p2,
+# kern.disks = nda0, gpart list nda0 = empty, but gpart list diskid/DISK-abc123
+# returns a rawuuid matching BootCurrent PARTUUID.
+# Step 3 diskid fallback (_EFI_DISKID_DEV) must find diskid/DISK-abc123 and
+# efi_root_disks (R-16) returns diskid/DISK-abc123 directly.
+# Expected: ESP "diskid/DISK-abc123 1 GPT" found.
+_diskid_tmp="$(mktemp -d)"
+touch "${_diskid_tmp}/DISK-abc123"
+touch "${_diskid_tmp}/DISK-abc123p1"
+touch "${_diskid_tmp}/DISK-abc123p2"
+_EFI_DISKID_DEV="${_diskid_tmp}"
+export _EFI_DISKID_DEV
+mock_cmd efibootmgr 'printf "BootCurrent: 0001\nBootOrder: 0001\n+Boot0001* FreeBSD\n       dp: HD(1,GPT,aaaa1111-bbbb-cccc-dddd-000000000001,0x800,0x7f800)/File(\\EFI\\FreeBSD\\loader.efi)\n"'
+mock_cmd sysctl 'case "$*" in *kern.disks*) echo "nda0" ;; *) echo "0" ;; esac'
+mock_cmd gpart '
+case "$*" in
+    *list*nda0*)
+        : ;;
+    *list*"diskid/DISK-abc123"*)
+        printf "Geom name: nda0\nProviders:\n1. Name: nda0p1\n   rawuuid: aaaa1111-bbbb-cccc-dddd-000000000001\n2. Name: nda0p2\n   rawuuid: aaaa1111-bbbb-cccc-dddd-000000000002\n"
+        ;;
+    *show*"diskid/DISK-abc123"*)
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"200M\"},{\"index\":2,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"462G\"}]}]}\n"
+        ;;
+    *) exit 1 ;;
+esac'
+mock_cmd realpath 'echo "/dev/diskid/DISK-abc123p2"'
+mock_cmd mount 'printf "{\"mount\":{\"mounted\":[{\"special\":\"zroot/ROOT/default\",\"node\":\"/\",\"fstype\":\"zfs\",\"opts\":[\"rw\"]}]}}\n"'
+mock_cmd zpool 'printf "  pool: zroot\n state: ONLINE\nconfig:\n\tNAME\tSTATE\n\tzroot\tONLINE\n\t  diskid/DISK-abc123p2\tONLINE\n"'
+_result="$(efi_boot_esps 2>/dev/null)"
+assert_eq "R-16 diskid: Step 3 fallback finds diskid/DISK-abc123 1 GPT" "${_result}" "diskid/DISK-abc123 1 GPT"
+_EFI_DISKID_DEV=/dev/diskid
+export _EFI_DISKID_DEV
+rm -rf "${_diskid_tmp}"
 
 tap_end
 

@@ -170,6 +170,45 @@ verification that only the boot disk ESP is updated.
 
 ---
 
+## R-15 / R-16 — `diskid/` vdev labels not resolved; kern.disks scan-all also broken on FreeBSD-CURRENT
+
+**Reported by:** Stefan Esser \<se@freebsd.org\> (D58990 feedback, 2026-08-23/25)
+**Symptom:** On systems where the ZFS pool vdev is referenced by a `diskid/`
+alias (e.g. `diskid/DISK-8ESKF03YZ0EAp2`), `efi_root_disks` returned empty and
+`efi_boot_esps` emitted "cannot determine boot/root disks", skipping all ESP
+updates.
+**Root cause (R-15):** `glabel(8) status` only enumerates labels managed by
+`geom_label(4)` (i.e. `gpt/`, `gptid/`, `ufs/`).  `diskid/` labels are
+managed by a completely separate kernel module, `geom_diskid(4)`, and do **not**
+appear in `glabel status` output.  On newer FreeBSD kernels, `/dev/diskid/*`
+paths are character device nodes (not symlinks), so `realpath(1)` returns the
+path unchanged.
+**Root cause (R-16):** The R-15 fix used a `kern.disks` scan-all to resolve the
+diskid label to a physical disk name (e.g. `nda0`).  Stefan's debug output
+(FreeBSD-CURRENT, 2026-08-25) confirmed that `gpart list nda0` (and all other
+short disk names) returns **empty** on FreeBSD-CURRENT — so the scan-all always
+failed.  `gpart list diskid/DISK-xxx` works correctly on the same system.
+`efi_boot_esps` Step 3 had the same scan-all pattern and also failed.
+**Fix (R-16):** Strip the partition suffix from the diskid label directly
+(`diskid/DISK-abc123p2` → `diskid/DISK-abc123`) and use the diskid provider
+name as the disk reference — no kern.disks scan needed.  `gpart list/show` and
+partition device paths (`/dev/diskid/DISK-abc123p1`) accept diskid provider
+names on all FreeBSD versions.  Applied to both the ZFS vdev resolution loop
+and the UFS root-device path.  A separate diskid fallback was also added to
+`efi_boot_esps` Step 3 (BootCurrent PARTUUID scan): when the kern.disks scan
+finds nothing, the code scans `/dev/diskid/` provider names via
+`_EFI_DISKID_DEV` (overridable in tests) and calls `gpart list diskid/DISK-xxx`
+for each.  `gpt/` and `gptid/` labels remain resolved via `glabel status`
+(unaffected).
+**Tests:** `tests/unit/test_14_root_disks.sh` — test 27
+("ZFS diskid: realpath unchanged, returns diskid/DISK-abc123 directly"),
+test 28 ("UFS diskid: realpath unchanged, partition suffix stripped → diskid/DISK-abc123"),
+test 29 ("ZFS diskid p2 suffix (Stefan topology): R-16 returns diskid/DISK-abc123 without gpart list");
+`tests/unit/test_15_boot_esps.sh` — test 28
+("R-16 diskid: Step 3 fallback finds diskid/DISK-abc123 1 GPT")
+
+---
+
 ## R-04 — `gpart show` fixture `=>` rendered as HTML entity `&gt;`
 
 **Found during:** test development (2026-08-20)
