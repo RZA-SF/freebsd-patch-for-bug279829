@@ -1,6 +1,0 @@
-=>      40  976773168  nvd0  GPT  (466G)
-        40     409600     1  efi  [efi0]  (200M)
-    409640  952795136     2  freebsd-zfs  [zfs0]  (454G)
- 953204776   23568384     3  freebsd-swap  [swap0]  (11G)
-
-errors: No known data errors

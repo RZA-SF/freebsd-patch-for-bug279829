@@ -65,9 +65,7 @@ mock_cmd realpath 'echo "/dev/${1#/dev/}"'
 mock_cmd gpart '
 case "$*" in
     *show*da0*)
-        printf "=>      63  61439937  da0  MBR  (29G)\n"
-        printf "      2048    102400    1  fat32lba  [active]  (50M)\n"
-        printf "    104448  61335552    2  freebsd  (29G)\n"
+        printf "{\"PART\":[{\"scheme\":\"MBR\",\"partitions\":[{\"index\":1,\"type\":\"fat32lba\",\"label\":\"\",\"rawtype\":\"!0c\",\"size\":\"50M\"},{\"index\":2,\"type\":\"freebsd\",\"label\":\"\",\"rawtype\":\"!a5\",\"size\":\"29G\"}]}]}\n"
         ;;
     *) exit 1 ;;
 esac'

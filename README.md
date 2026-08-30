@@ -2,7 +2,7 @@
 
 This repository contains a patch for `freebsd-update` that automatically updates the EFI bootloader on the ESP (EFI System Partition) during `freebsd-update install`. Without this fix, upgrading FreeBSD across major versions can silently leave a stale bootloader on the ESP — one that cannot boot the newly installed system.
 
-The patch is developed here ahead of submission to the FreeBSD project via Phabricator. It has been tested on real FreeBSD hardware across multiple versions with a 286-test suite covering unit, integration, and error conditions across all supported configurations.
+The patch is developed here ahead of submission to the FreeBSD project via Phabricator. It has been tested on real FreeBSD hardware across multiple versions with a 291-test suite covering unit, integration, and error conditions across all supported configurations.
 
 **Addresses:** [FreeBSD bug 279829](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=279829)
 **Upstream status:** Closed "Not a bug" — but the underlying hazard is real and ongoing
@@ -13,23 +13,21 @@ The patch is developed here ahead of submission to the FreeBSD project via Phabr
 
 | | |
 |---|---|
-| Test suite | 286 / 286 passing |
+| Test suite | 291 / 291 passing |
 | Live run | ✓ Complete — FreeBSD 14.0-RELEASE-p11, amd64, UEFI, ZFS, NVMe |
-| Phabricator submission | ✓ [D58990](https://reviews.freebsd.org/D58990) — revision 2 in progress |
+| Phabricator submission | ✓ [D58990](https://reviews.freebsd.org/D58990) — submitted; revision-3 diff in preparation (R-17) |
 | Backport targets | `main` (15-CURRENT), `stable/14`, `stable/13` |
 
 ### Test Suite Run History
 
-| Date | Platform | Version | Result | Notes |
-|------|----------|---------|--------|-------|
-| 2026-08-21 | amd64 | FreeBSD 14.0-RELEASE-p11 | ✓ 266/266 | First FreeBSD run confirming chflags schg fix (test_11) and PATH tightening for test_e09; stray nda0 stdout in test_14 test 7 noted |
-| 2026-08-21 | amd64 | FreeBSD 15.1-RELEASE-p2 | ✓ 266/266 | Pre-rollup: confirmed efibootmgr PATH restriction holds on 15.x base system; stray nda0 stdout noted |
-| 2026-08-21 | amd64 | FreeBSD 15.1-RELEASE-p2 | ✓ 266/266 | Post-rollup (4cc8d91): stray nda0 stdout fix confirmed clean; no regressions |
-| 2026-08-21 | amd64 | FreeBSD 14.0-RELEASE-p11 | ✓ 266/266 | Post-rollup (4cc8d91): clean pass, stdout fix confirmed on 14.0 as well |
-| 2026-08-21 | amd64 | FreeBSD 14.0-RELEASE-p11 | ✓ 269/269 | Post-R-09 (2ddc59e): R-09 fixes confirmed; new tests 25–26 (test_14) and test 23 (test_15) all pass |
-| 2026-08-21 | amd64 | FreeBSD 15.1-RELEASE-p2 | ✓ 269/269 | Post-R-09 (3ace096): clean pass on 15.x; no regressions |
-| 2026-08-23 | amd64 | FreeBSD 14.0-RELEASE-p11 | ✓ 286/286 | Post-R-14: R-14 split-media guard + loader compat docs; all new tests pass |
-| 2026-08-23 | amd64 | FreeBSD 15.1-RELEASE-p2 | ✓ 286/286 | Post-R-14: clean pass on 15.x; no regressions |
+291/291 tests passing. Validated across:
+- **Architectures:** amd64, aarch64
+- **FreeBSD versions:** 13.5, 14.0, 14.4, 15.1 (RELEASE and CURRENT)
+- **Root filesystems:** ZFS, UFS
+- **Boot:** EFI-only, EFI+BIOS (gptboot/gptzfsboot)
+- **Platforms:** physical workstation, AWS EC2, AWS Graviton
+
+Full run log and per-environment detail: [docs/hardware-reports.md](docs/hardware-reports.md#coverage-matrix).
 
 ---
 

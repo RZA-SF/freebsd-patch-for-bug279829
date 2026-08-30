@@ -110,16 +110,10 @@ ZPS'
 mock_cmd gpart '
 case "$*" in
     *show*da0*)
-        printf "=>       40  976773095  da0  GPT  (466G)\n"
-        printf "         40     409600     1  efi  (200M)\n"
-        printf "     409640       1024     2  freebsd-boot  (512K)\n"
-        printf "     410664  976362432     3  freebsd-zfs  (465G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"200M\"},{\"index\":2,\"type\":\"freebsd-boot\",\"label\":\"\",\"rawtype\":\"83bd6b9d-7f41-11dc-be0b-001560b84f0f\",\"size\":\"512K\"},{\"index\":3,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"465G\"}]}]}\n"
         ;;
     *show*da1*)
-        printf "=>       40  976773095  da1  GPT  (466G)\n"
-        printf "         40     409600     1  efi  (200M)\n"
-        printf "     409640       1024     2  freebsd-boot  (512K)\n"
-        printf "     410664  976362432     3  freebsd-zfs  (465G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"200M\"},{\"index\":2,\"type\":\"freebsd-boot\",\"label\":\"\",\"rawtype\":\"83bd6b9d-7f41-11dc-be0b-001560b84f0f\",\"size\":\"512K\"},{\"index\":3,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"465G\"}]}]}\n"
         ;;
     *bootcode*)
         exit 0

@@ -72,9 +72,7 @@ ZPS'
 mock_cmd gpart '
 case "$*" in
     *show*mmcsd0*)
-        printf "=>       40  62333952  mmcsd0  GPT  (30G)\n"
-        printf "         40    204800     1  efi  (100M)\n"
-        printf "     204840  62129152     2  freebsd-zfs  (30G)\n"
+        printf "{\"PART\":[{\"scheme\":\"GPT\",\"partitions\":[{\"index\":1,\"type\":\"efi\",\"label\":\"\",\"rawtype\":\"c12a7328-f81f-11d2-ba4b-00a0c93ec93b\",\"size\":\"100M\"},{\"index\":2,\"type\":\"freebsd-zfs\",\"label\":\"\",\"rawtype\":\"516e7cba-6ecf-11d6-8ff8-00022d09712b\",\"size\":\"30G\"}]}]}\n"
         ;;
     *) exit 1 ;;
 esac'
