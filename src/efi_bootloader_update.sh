@@ -35,6 +35,12 @@ _EFI_FINGERPRINT_THRESHOLD=2
 # tests to point at a temporary directory populated with stub files.
 : "${_EFI_DISKID_DEV:=/dev/diskid}"
 
+# Source binary for the 32-bit EFI fallback loader.  Present only on amd64
+# with FreeBSD 14.3 and later; absent on 13.x and 14.0-14.2.  The existence
+# check in efi_update_esp is the sole detection mechanism — no firmware probing
+# is required.  Set to an empty string or a non-existent path to disable.
+: "${_EFI_LOADER_IA32_SRC:=/boot/loader_ia32.efi}"
+
 # ============================================================
 # LOGGING
 # ============================================================
@@ -853,12 +859,14 @@ efi_unmount_esp() {
 # Returns 0 if the given file appears to be a FreeBSD EFI loader binary.
 #
 # Primary check: bootprog_info string embedded by newvers.sh in all FreeBSD
-# loaders since FreeBSD 11 — "FreeBSD/<arch> EFI, Revision N.N".  This
-# pattern is specific enough to eliminate false positives from other OSes.
+# loaders.  FreeBSD 14.0+ uses "FreeBSD/<arch> EFI loader, Revision N.N";
+# older builds used "FreeBSD/<arch> EFI, Revision N.N".  The pattern matches
+# both: "EFI " (space before "loader,") and "EFI," (comma immediately after).
+# Specific enough to eliminate false positives from other OSes.
 #
 # Fallback: multi-string heuristic requiring _EFI_FINGERPRINT_THRESHOLD of
-# "FreeBSD", "loader.efi", "boot/lua" — covers older binaries that predate
-# the bootprog_info format.
+# "FreeBSD", "loader.efi", "boot/lua" — covers binaries where the primary
+# pattern does not match.
 efi_is_freebsd_loader() {
     local file="$1"
 
@@ -866,7 +874,7 @@ efi_is_freebsd_loader() {
     [ -s "$file" ] || return 1   # must be non-empty
 
     # Primary: match the bootprog_info pattern.
-    if strings "$file" 2>/dev/null | grep -qE 'FreeBSD/[^ ]+ EFI,'; then
+    if strings "$file" 2>/dev/null | grep -qE 'FreeBSD/[^ ]+ EFI[ ,]'; then
         _efi_verb "Fingerprint '${file}': bootprog_info match"
         return 0
     fi
@@ -1120,6 +1128,49 @@ efi_update_esp() {
         if [ "$errors" -eq 0 ]; then
             efi_safe_copy "${EFI_LOADER_SRC}" "$fallback_file" || errors=$((errors + 1))
             [ "${_efi_copy_wrote:-0}" = "1" ] && updated=$((updated + 1))
+        fi
+    fi
+
+    # ── 2b. ia32 fallback binary: /EFI/BOOT/BOOTia32.efi ─────────────────────
+    #
+    # amd64 + FreeBSD 14.3+ only: /boot/loader_ia32.efi is present when the
+    # running system can support 32-bit UEFI firmware.  The existence check is
+    # the sole detection mechanism — no firmware probing is needed or performed.
+    # On FreeBSD 13.x and 14.0-14.2 the source file is absent; this block is
+    # skipped silently.  NVRAM entry management is not attempted here: EFIRT
+    # is unavailable on 32-bit UEFI firmware (no /dev/efi), which is the only
+    # scenario where BOOTia32.efi is the active boot path.
+
+    if [ -f "${_EFI_LOADER_IA32_SRC}" ]; then
+        local ia32_file
+        ia32_file=$(find "$boot_dir" -maxdepth 1 -type f \
+            -iname "BOOTia32.efi" 2>/dev/null | head -1) || true
+
+        if [ -n "$ia32_file" ]; then
+            # Existing BOOTia32.efi — update only if it fingerprints as FreeBSD.
+            if efi_is_freebsd_loader "$ia32_file"; then
+                efi_safe_copy "${_EFI_LOADER_IA32_SRC}" "$ia32_file" || \
+                    errors=$((errors + 1))
+                [ "${_efi_copy_wrote:-0}" = "1" ] && updated=$((updated + 1))
+            else
+                _efi_warn "$(basename "$ia32_file") at ${ia32_file} does not fingerprint as FreeBSD — skipping"
+                _efi_warn "Another OS may own this path; manual installation of loader_ia32.efi required"
+            fi
+        else
+            # No BOOTia32.efi present — install it.
+            local ia32_dst="${boot_dir}/BOOTia32.efi"
+            _efi_info "Installing ia32 fallback loader: ${ia32_dst}"
+            if [ "${EFI_DRY_RUN}" != "1" ]; then
+                mkdir -p "$boot_dir" 2>/dev/null || {
+                    _efi_err "Cannot create directory: ${boot_dir}"
+                    errors=$((errors + 1))
+                }
+            fi
+            if [ "$errors" -eq 0 ]; then
+                efi_safe_copy "${_EFI_LOADER_IA32_SRC}" "$ia32_dst" || \
+                    errors=$((errors + 1))
+                [ "${_efi_copy_wrote:-0}" = "1" ] && updated=$((updated + 1))
+            fi
         fi
     fi
 

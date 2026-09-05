@@ -5,7 +5,9 @@
 # real `strings` binary on actual temp files written for each test case,
 # so no mocking of strings is needed.
 #
-# Primary check: bootprog_info pattern "FreeBSD/<arch> EFI," (since FreeBSD 11).
+# Primary check: bootprog_info pattern "FreeBSD/<arch> EFI[ ,]".
+#   FreeBSD 14.0+ format: "FreeBSD/<arch> EFI loader, Revision N.N"
+#   Pre-14.0 format:      "FreeBSD/<arch> EFI, Revision N.N"
 # Fallback: 2-of-3 heuristic ("FreeBSD", "loader.efi", "boot/lua").
 
 TESTS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,7 +29,7 @@ export EFI_LOADER_SRC
 
 _tmpdir="$(mktemp -d)"
 
-tap_begin 8
+tap_begin 11
 
 # Test 1: all three markers present -> returns 0 (is FreeBSD loader)
 _f1="${_tmpdir}/all_three.bin"
@@ -60,20 +62,37 @@ assert_false "non-existent file -> returns 1" \
 
 # ── bootprog_info primary check ───────────────────────────────────────────────
 
-# Test 7: bootprog_info string present -> returns 0 via primary check.
-# newvers.sh embeds "FreeBSD/<arch> EFI, Revision N.N" in all loaders since
-# FreeBSD 11.  This must match even without the heuristic markers.
-_f7="${_tmpdir}/bootprog_info.bin"
+# Test 7: pre-14.0 bootprog_info format "EFI," -> returns 0 via primary check.
+_f7="${_tmpdir}/bootprog_info_old.bin"
 printf 'FreeBSD/amd64 EFI, Revision 1.1\0some_other_content\n' > "${_f7}"
 assert_true "bootprog_info 'FreeBSD/amd64 EFI,' -> returns 0" \
     efi_is_freebsd_loader "${_f7}"
 
-# Test 8: bootprog_info matches arm64 variant -> returns 0.
-# Pattern must cover all architectures, not just amd64.
-_f8="${_tmpdir}/bootprog_info_arm64.bin"
+# Test 8: pre-14.0 bootprog_info arm64 variant -> returns 0.
+_f8="${_tmpdir}/bootprog_info_arm64_old.bin"
 printf 'FreeBSD/arm64 EFI, Revision 1.1\0unrelated\n' > "${_f8}"
 assert_true "bootprog_info 'FreeBSD/arm64 EFI,' -> returns 0" \
     efi_is_freebsd_loader "${_f8}"
+
+# Test 9: FreeBSD 14.0+ 64-bit format "EFI loader," -> returns 0 via primary.
+# Confirmed on 14.0-RELEASE-p11, 14.3-RELEASE, 15.1-RELEASE-p3.
+_f9="${_tmpdir}/bootprog_info_14x.bin"
+printf 'FreeBSD/amd64 EFI loader, Revision 1.1\0some_other_content\n' > "${_f9}"
+assert_true "bootprog_info 'FreeBSD/amd64 EFI loader,' -> returns 0" \
+    efi_is_freebsd_loader "${_f9}"
+
+# Test 10: FreeBSD 14.3+ 64-bit Revision 3.0 format -> returns 0.
+_f10="${_tmpdir}/bootprog_info_14x_r3.bin"
+printf 'FreeBSD/amd64 EFI loader, Revision 3.0\0some_other_content\n' > "${_f10}"
+assert_true "bootprog_info 'FreeBSD/amd64 EFI loader, Revision 3.0' -> returns 0" \
+    efi_is_freebsd_loader "${_f10}"
+
+# Test 11: ia32 loader format "FreeBSD/amd64-ia32 EFI loader," -> returns 0.
+# loader_ia32.efi on 14.3-RELEASE and 15.1-RELEASE-p3.
+_f11="${_tmpdir}/bootprog_info_ia32.bin"
+printf 'FreeBSD/amd64-ia32 EFI loader, Revision 3.0\0some_other_content\n' > "${_f11}"
+assert_true "bootprog_info 'FreeBSD/amd64-ia32 EFI loader,' -> returns 0" \
+    efi_is_freebsd_loader "${_f11}"
 
 tap_end
 
