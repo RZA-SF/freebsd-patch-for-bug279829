@@ -11,10 +11,10 @@ notes and bug narratives follow in the [contributor sections](#contributor-detai
 ## Coverage Matrix
 
 Each row is one test environment. **Suite** = `./tests/run_tests.sh` pass
-count on that FreeBSD version. **Run** = live or dry-run execution on real
-hardware/cloud. **Bugs** = fix revisions first surfaced by this environment
-(full narratives in the detail sections). All listed environments pass the
-current 291-test suite.
+count on that FreeBSD version at time of testing (current suite: 312 tests).
+**Run** = live or dry-run execution on real hardware/cloud. **Bugs** = fix
+revisions first surfaced by this environment (full narratives in the detail
+sections).
 
 | Who | Platform | Arch | FreeBSD | Root FS | Scheme | Boot | Suite | Run | Bugs surfaced |
 |-----|----------|------|---------|---------|--------|------|-------|-----|---------------|
@@ -37,6 +37,7 @@ current 291-test suite.
 | RZA-SF | AWS EC2 | amd64 | 14.4-RELEASE-p9 | UFS | GPT | EFI+BIOS | 291/291 | dry-run | — |
 | RZA-SF | AWS EC2 | amd64 | 15.1-RELEASE-p3 | UFS | GPT | EFI+BIOS | 291/291 | dry-run | — |
 | RZA-SF | AWS EC2 | amd64 | 15.1-RELEASE-p3 | ZFS | GPT | EFI+BIOS | 291/291 | dry-run | — |
+| RZA-SF | Intel Pocket PC (Z3736F, Bay Trail) | amd64 | 14.3-RELEASE | UFS | GPT | EFI 32-bit | 310/310 | ✓ live + dry-run | R-fingerprint, R-ia32 |
 
 **Boot column:** EFI = EFI loader only (no freebsd-boot partition present).
 EFI+BIOS = both EFI loader and BIOS bootcode (`gptboot`/`gptzfsboot`) updated.
@@ -465,6 +466,39 @@ FreeBSD — flags must be passed as separate `-o` arguments.
 **R-02 detail:** `efibootmgr -l` requires a Unix-style path (`/EFI/FreeBSD/loader.efi`),
 not a Windows-style backslash path (`\EFI\FreeBSD\loader.efi`). Early code
 passed the backslash form.
+
+### Live run — revision-4 (Z3736F, 32-bit UEFI)
+
+| Date | Platform | Arch | FreeBSD | Root FS | Disk | Boot | Outcome |
+|------|----------|------|---------|---------|------|------|---------|
+| 2026-09-04 | Generic Intel Pocket PC (Atom Z3736F, Bay Trail-CR) | amd64 | 14.3-RELEASE | UFS | eMMC (mmcsd0p5) | 32-bit UEFI | ✓ 310/310 tests + live dry-run. Surfaced fingerprint pattern regression (R-fingerprint) and validated ia32 feature (R-ia32). |
+
+**Hardware:**
+- SoC: Intel Atom Z3736F (Bay Trail-CR) — 64-bit capable, 32-bit UEFI firmware
+- Storage: 31GB MMCHC BWBD3R eMMC (`mmcsd0`); ESP at `mmcsd0p1` (100 MB GPT, Windows-formatted)
+- FreeBSD 14.3-RELEASE installed to `mmcsd0p5` (20 GB, dual-boot alongside Windows 10)
+- Boot confirmation: `/dev/efi` absent; `efibootmgr` fails (`efi variables not supported`)
+
+**Fingerprint regression (R-fingerprint):**
+
+Discovered via `--dry-run --verbose` trace: primary fingerprint pattern `FreeBSD/[^ ]+ EFI,` did not match `BOOTx64.efi` on this 14.3 system. FreeBSD 14.0+ changed the `bootprog_info` format from `FreeBSD/amd64 EFI, Revision 1.1` (pre-14.0) to `FreeBSD/amd64 EFI loader, Revision 1.1` (14.0+). The old pattern requires a comma immediately after `EFI`; the new format has a space and the word `loader` before the comma. The heuristic path (`FreeBSD` + `boot/lua` = 2/3) was covering for this silently. Fix: pattern changed to `FreeBSD/[^ ]+ EFI[ ,]`, covering both formats and the ia32 variant (`FreeBSD/amd64-ia32 EFI loader, ...`). Confirmed via `strings` on live 14.0-RELEASE-p11, 14.3-RELEASE, and 15.1-RELEASE-p3 loaders.
+
+**ia32 feature (R-ia32):**
+
+`/boot/loader_ia32.efi` present on 14.3-RELEASE (619 KB, Jun 2025). Script correctly:
+- Detected source binary present → entered ia32 block
+- Found existing `EFI/Boot/bootia32.efi` (Windows-owned, 1,024,928 bytes) → did not fingerprint as FreeBSD → printed WARN and skipped (Windows binary preserved)
+- After manually placing `loader_ia32.efi` as `BOOTia32.efi` (test scenario): fingerprinted as FreeBSD → updated correctly
+
+**eMMC notes:**
+
+`gpart show -p --libxo json mmcsd0` fails on this hardware (eMMC has hardware boot partitions; gpart exits non-zero). `_efi_gpart_show_norm` text-mode fallback fires and produces correct output. `/dev/efi` absent; NVRAM step skipped gracefully.
+
+**OEM Bay Trail firmware behavior:**
+
+Firmware ignores UEFI `BootOrder` variable entirely and does not respond to `bcdedit /set {bootmgr} path` (which modifies the BCD file, not the UEFI NVRAM `BootXXXX` variable). Only solution: replace `EFI/Microsoft/Boot/BOOTMGFW.EFI` with the FreeBSD ia32 loader (firmware hardcodes this path in ROM). Documented in [contrib/howto-ia32-uefi-nvram-windows.md](../contrib/howto-ia32-uefi-nvram-windows.md) as Method 2, Option B.
+
+---
 
 ### Test suite runs — revision-2 rollup (4cc8d91)
 
@@ -895,6 +929,12 @@ for `gptzfsboot` (177KB vs 61KB for `gptboot` on the UFS instance).
 | 2026-08-28 | AWS EC2 | amd64 | 14.4-RELEASE-p9 | ✓ 291/291 | JSON path (14.x); UFS root; combined EFI+BIOS update path; two-entry mount-table loop (UFS gpt/rootfs adds iteration); gptboot |
 | 2026-08-28 | AWS EC2 | amd64 | 15.1-RELEASE-p3 | ✓ 291/291 | JSON path (15.x); ZFS root; combined EFI+BIOS update path; gpt/efiboot0 label (new in 15.x AMI); one-entry mount-table loop (ZFS); gptzfsboot |
 
+### Test suite runs — revision-4 (ia32 + fingerprint fix)
+
+| Date | Platform | Arch | FreeBSD | Result | Notes |
+|------|----------|------|---------|--------|-------|
+| 2026-09-04 | Intel Pocket PC (Z3736F, eMMC) | amd64 | 14.3-RELEASE | ✓ 310/310 | revision-4: fingerprint EFI[ ,] fix + 4 ia32 integration tests + 3 fingerprint unit tests; live 32-bit UEFI hardware; /dev/efi absent; gpart text fallback (eMMC); all 47 test files pass |
+
 ---
 
 ## Test Suite Run Log
@@ -923,6 +963,7 @@ Chronological record of all test suite runs across the development of this patch
 | 2026-08-28 | aarch64 | 14.4-RELEASE-p9 | AWS Graviton EC2 | ZFS | EFI | ✓ 291/291 | ZFS root; machdep.bootmethod absent → UEFI assumed; gpt/efiesp glabel; 2-partition GPT; no BIOS partition; dry-run clean |
 | 2026-08-28 | amd64 | 15.1-RELEASE-p3 | AWS EC2 | UFS | EFI+BIOS | ✓ 291/291 | First amd64 15.x EC2 result; same 3-partition AMI layout as 13.5/14.4 UFS; gpt/efiboot0 label; gptboot on p1; two-entry glabel loop; dry-run clean |
 | 2026-08-28 | amd64 | 15.1-RELEASE-p3 | AWS EC2 | ZFS | EFI+BIOS | ✓ 291/291 | ZFS counterpart to 15.1 UFS; gpt/efiboot0 label; one-entry glabel loop (ZFS); gptzfsboot on p1 (177KB); dry-run clean |
+| 2026-09-04 | amd64 | 14.3-RELEASE | Intel Pocket PC (Z3736F) | UFS | EFI 32-bit | ✓ 310/310 | revision-4: fingerprint fix (EFI[ ,]) + ia32 feature; live hardware; gpart --libxo fails on eMMC → text fallback; /dev/efi absent; NVRAM skipped |
 
 ---
 
