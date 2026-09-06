@@ -38,7 +38,7 @@ export EFI_LOADER_SRC
 _ESP_MOUNT="/tmp/esp_test"
 _LOADER_ABS="${_ESP_MOUNT}/EFI/FreeBSD/loader.efi"
 
-tap_begin 8
+tap_begin 10
 
 # Simulate EFIRT available for all tests except the EFIRT-absent test.
 _EFI_DEV_EFI=/dev/null
@@ -112,12 +112,16 @@ EFI_DRY_RUN=0
 # to efibootmgr -l.  FreeBSD efibootmgr expects a Unix path on the mounted
 # ESP and translates it to a UEFI device path itself.  Passing a backslash
 # path caused: "Cannot translate unix loader path: No such file or directory".
+# Note: the create call (-a -c) is no longer the last efibootmgr call (a
+# subsequent call reads BootOrder to fix position); grep the log for the -l
+# call specifically.
 : > "${MOCK_CALL_LOG}"
 mock_cmd efibootmgr "cat \"${FIXTURES_DIR}/efibootmgr_no_freebsd.txt\""
 hash -r 2>/dev/null || true
 EFI_DRY_RUN=0
 efi_ensure_nvram_entry "${_ESP_MOUNT}" "${_LOADER_ABS}" 2>/dev/null
-_create_args="$(mock_last_args efibootmgr)"
+_create_args=$(grep "^efibootmgr" "${MOCK_CALL_LOG}" | grep -- " -l " | \
+    head -1 | sed "s/^efibootmgr //")
 assert_contains \
     "efibootmgr -l: Unix path passed (not EFI backslash path)" \
     "${_create_args}" "${_LOADER_ABS}"
@@ -136,6 +140,65 @@ _count="$(mock_call_count efibootmgr)"
 assert_eq "EFIRT absent -> efibootmgr not called" "${_count}" "0"
 # Restore for any subsequent tests
 _EFI_DEV_EFI=/dev/null
+
+# Test 8: FreeBSD owned the fallback (fallback_is_freebsd=1) and it was
+# first in BootOrder -> new entry placed at that same ordinal position (0).
+# Mock sequence: call 1 = pre-create query (fallback_only: BootOrder 0001,
+# Boot0001→BOOTx64.efi); call 2 = create (exit 0); call 3 = post-create read
+# (after_create_0005: BootOrder 0005,0001); call 4 = efibootmgr -o (exit 0).
+# Expected -o argument: "0005,0001" (new entry at position 0).
+: > "${MOCK_CALL_LOG}"
+cat > "${MOCK_BIN}/efibootmgr" << MOCK_EOF
+#!/bin/sh
+echo "efibootmgr \$*" >> "\${MOCK_CALL_LOG}"
+_n=\$(grep -c "^efibootmgr" "\${MOCK_CALL_LOG}" 2>/dev/null || echo 0)
+case "\${_n}" in
+    1) cat "${FIXTURES_DIR}/efibootmgr_fallback_only.txt" ; exit 0 ;;
+    2) exit 0 ;;
+    3) cat "${FIXTURES_DIR}/efibootmgr_after_create_0005.txt" ; exit 0 ;;
+    *) exit 0 ;;
+esac
+MOCK_EOF
+chmod +x "${MOCK_BIN}/efibootmgr"
+hash -r 2>/dev/null || true
+_EFI_DEV_EFI=/dev/null
+EFI_DRY_RUN=0
+efi_ensure_nvram_entry "${_ESP_MOUNT}" "${_LOADER_ABS}" \
+    "BOOTx64.efi" "1" 2>/dev/null
+_o_args=$(grep "^efibootmgr" "${MOCK_CALL_LOG}" | grep -- " -o " | \
+    head -1 | sed "s/^efibootmgr //")
+assert_contains \
+    "FreeBSD fallback first: new entry placed at position 0 (0005,0001)" \
+    "${_o_args}" "0005,0001"
+
+# Test 9: Another OS owned the fallback (fallback_is_freebsd=0) ->
+# new entry appended to end of BootOrder.
+# Mock sequence: call 1 = pre-create query (no_freebsd: BootOrder 0001,0000,
+# Boot0001→Windows); call 2 = create (exit 0); call 3 = post-create read
+# (after_create_0005 adjusted: BootOrder 0005,0001,0000); call 4 = -o.
+# Expected -o argument: "0001,0000,0005" (new entry at the end).
+: > "${MOCK_CALL_LOG}"
+cat > "${MOCK_BIN}/efibootmgr" << MOCK_EOF
+#!/bin/sh
+echo "efibootmgr \$*" >> "\${MOCK_CALL_LOG}"
+_n=\$(grep -c "^efibootmgr" "\${MOCK_CALL_LOG}" 2>/dev/null || echo 0)
+case "\${_n}" in
+    1) cat "${FIXTURES_DIR}/efibootmgr_no_freebsd.txt" ; exit 0 ;;
+    2) exit 0 ;;
+    3) printf 'BootOrder  : 0005, 0001, 0000\n' ; exit 0 ;;
+    *) exit 0 ;;
+esac
+MOCK_EOF
+chmod +x "${MOCK_BIN}/efibootmgr"
+hash -r 2>/dev/null || true
+EFI_DRY_RUN=0
+efi_ensure_nvram_entry "${_ESP_MOUNT}" "${_LOADER_ABS}" \
+    "BOOTx64.efi" "0" 2>/dev/null
+_o_args=$(grep "^efibootmgr" "${MOCK_CALL_LOG}" | grep -- " -o " | \
+    head -1 | sed "s/^efibootmgr //")
+assert_contains \
+    "Non-FreeBSD fallback: new entry appended to end (0001,0000,0005)" \
+    "${_o_args}" "0001,0000,0005"
 
 tap_end
 

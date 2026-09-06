@@ -984,9 +984,16 @@ efi_safe_copy() {
 # Non-fatal: many systems boot fine without an explicit NVRAM entry (fallback
 # path covers them), efibootmgr may not be installed, or EFIRT (/dev/efi) may
 # be unavailable (custom kernel without options EFIRT, or i386/armv7/riscv64).
+#
+# When creating a new entry, preserves the user's existing BootOrder rather
+# than blindly prepending: if the fallback binary on this ESP belonged to
+# FreeBSD (fallback_is_freebsd=1), the new entry is inserted at the same
+# ordinal position the fallback held.  Otherwise it is appended to the end.
 efi_ensure_nvram_entry() {
     local esp_mount="$1"
     local freebsd_loader_abs="$2"  # absolute path on mounted ESP
+    local fallback_binary="${3:-}"       # e.g. BOOTx64.efi
+    local fallback_is_freebsd="${4:-0}"  # 1 if fallback file belongs to FreeBSD
 
     if [ "${EFI_NVRAM_UPDATE}" != "1" ]; then
         _efi_verb "EFI_NVRAM_UPDATE=0 — skipping NVRAM boot entry management"
@@ -1008,14 +1015,39 @@ efi_ensure_nvram_entry() {
     local efi_path
     efi_path=$(echo "$rel_path" | tr '/' '\\')
 
-    # Look for an existing FreeBSD entry that references /EFI/FreeBSD/loader.efi
-    local existing
-    existing=$(efibootmgr -v 2>/dev/null | \
+    # Single efibootmgr call: check for an existing FreeBSD entry AND capture
+    # the current BootOrder for position logic below.
+    local _efibm_out _existing _boot_order
+    _efibm_out=$(efibootmgr -v 2>/dev/null)
+    _existing=$(printf '%s\n' "$_efibm_out" | \
         grep -i "FreeBSD" | grep -i "loader\.efi") || true
 
-    if [ -n "$existing" ]; then
+    if [ -n "$_existing" ]; then
         _efi_verb "NVRAM FreeBSD entry already exists"
         return 0
+    fi
+
+    _boot_order=$(printf '%s\n' "$_efibm_out" | awk '/^BootOrder[[:space:]]*:/{
+        sub(/^BootOrder[[:space:]]*:[[:space:]]*/,"")
+        gsub(/,[[:space:]]*/," ")
+        gsub(/[[:space:]]*$/,"")
+        print; exit}')
+
+    # If the fallback belongs to FreeBSD, find its ordinal position in
+    # BootOrder so the new entry lands in the same slot (preserving the
+    # user's boot priority).  Otherwise the new entry is appended.
+    local _insert_pos=""
+    if [ "$fallback_is_freebsd" = "1" ] && [ -n "$fallback_binary" ] && \
+       [ -n "$_boot_order" ]; then
+        local _pos=0 _bnum
+        for _bnum in $_boot_order; do
+            if printf '%s\n' "$_efibm_out" | grep -i "Boot${_bnum}[* ]" | \
+               grep -qi "$fallback_binary"; then
+                _insert_pos="$_pos"
+                break
+            fi
+            _pos=$((_pos + 1))
+        done
     fi
 
     _efi_info "Adding NVRAM boot entry: FreeBSD → ${efi_path}"
@@ -1033,6 +1065,43 @@ efi_ensure_nvram_entry() {
         return 0   # still non-fatal
     }
     _efi_info "NVRAM boot entry created"
+
+    # Restore BootOrder with the new entry at the correct position.
+    # Skip if we have no baseline (cannot determine where to insert).
+    [ -n "$_boot_order" ] || return 0
+
+    local _new_order _new_num
+    _new_order=$(efibootmgr 2>/dev/null | awk '/^BootOrder[[:space:]]*:/{
+        sub(/^BootOrder[[:space:]]*:[[:space:]]*/,"")
+        gsub(/,[[:space:]]*/," ")
+        gsub(/[[:space:]]*$/,"")
+        print; exit}')
+
+    # The new entry was prepended by efibootmgr -c; it is the first entry in
+    # _new_order that was absent from _boot_order.
+    _new_num=$(for _n in $_new_order; do
+        _found=0
+        for _o in $_boot_order; do [ "$_n" = "$_o" ] && _found=1 && break; done
+        [ "$_found" = "0" ] && echo "$_n" && break
+    done)
+
+    [ -n "$_new_num" ] || return 0
+
+    # Build the corrected BootOrder.
+    local _rebuilt="" _pos=0 _bnum _inserted=0
+    for _bnum in $_boot_order; do
+        if [ -n "$_insert_pos" ] && [ "$_pos" = "$_insert_pos" ] && \
+           [ "$_inserted" = "0" ]; then
+            _rebuilt="${_rebuilt:+${_rebuilt},}${_new_num}"
+            _inserted=1
+        fi
+        _rebuilt="${_rebuilt:+${_rebuilt},}${_bnum}"
+        _pos=$((_pos + 1))
+    done
+    [ "$_inserted" = "0" ] && _rebuilt="${_rebuilt:+${_rebuilt},}${_new_num}"
+
+    efibootmgr -o "$_rebuilt" >/dev/null 2>&1 || \
+        _efi_warn "efibootmgr: could not set BootOrder — entry created but order not adjusted"
 }
 
 # Update all FreeBSD EFI loaders on a mounted ESP, and create the
@@ -1049,7 +1118,7 @@ efi_update_esp() {
         *)   device="/dev/${disk}p${part_index}" ;;
     esac
 
-    local updated=0 errors=0
+    local updated=0 errors=0 fallback_is_freebsd=0
 
     if [ "${EFI_DRY_RUN}" = "1" ] && [ "${_efi_esp_is_real:-0}" != "1" ]; then
         _efi_info "[DRY RUN] ESP not mounted — existing file/directory detection skipped; output reflects a blank ESP"
@@ -1106,6 +1175,7 @@ efi_update_esp() {
 
     if [ -n "$fallback_file" ]; then
         if efi_is_freebsd_loader "$fallback_file"; then
+            fallback_is_freebsd=1
             efi_safe_copy "${EFI_LOADER_SRC}" "$fallback_file" || errors=$((errors + 1))
             [ "${_efi_copy_wrote:-0}" = "1" ] && updated=$((updated + 1))
         else
@@ -1175,7 +1245,8 @@ efi_update_esp() {
     fi
 
     # ── 3.  NVRAM entry ────────────────────────────────────────────────────────
-    efi_ensure_nvram_entry "$esp_mount" "$freebsd_loader"
+    efi_ensure_nvram_entry "$esp_mount" "$freebsd_loader" \
+        "$fallback_binary" "$fallback_is_freebsd"
 
     # ── Summary ────────────────────────────────────────────────────────────────
     [ "$updated" -gt 0 ] && \
