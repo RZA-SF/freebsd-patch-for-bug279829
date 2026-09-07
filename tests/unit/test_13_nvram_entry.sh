@@ -38,7 +38,7 @@ export EFI_LOADER_SRC
 _ESP_MOUNT="/tmp/esp_test"
 _LOADER_ABS="${_ESP_MOUNT}/EFI/FreeBSD/loader.efi"
 
-tap_begin 8
+tap_begin 12
 
 # Simulate EFIRT available for all tests except the EFIRT-absent test.
 _EFI_DEV_EFI=/dev/null
@@ -112,12 +112,16 @@ EFI_DRY_RUN=0
 # to efibootmgr -l.  FreeBSD efibootmgr expects a Unix path on the mounted
 # ESP and translates it to a UEFI device path itself.  Passing a backslash
 # path caused: "Cannot translate unix loader path: No such file or directory".
+# Note: the create call (-a -c) is no longer the last efibootmgr call (a
+# subsequent call reads BootOrder to fix position); grep the log for the -l
+# call specifically.
 : > "${MOCK_CALL_LOG}"
 mock_cmd efibootmgr "cat \"${FIXTURES_DIR}/efibootmgr_no_freebsd.txt\""
 hash -r 2>/dev/null || true
 EFI_DRY_RUN=0
 efi_ensure_nvram_entry "${_ESP_MOUNT}" "${_LOADER_ABS}" 2>/dev/null
-_create_args="$(mock_last_args efibootmgr)"
+_create_args=$(grep "^efibootmgr" "${MOCK_CALL_LOG}" | grep -- " -l " | \
+    head -1 | sed "s/^efibootmgr //")
 assert_contains \
     "efibootmgr -l: Unix path passed (not EFI backslash path)" \
     "${_create_args}" "${_LOADER_ABS}"
@@ -136,6 +140,89 @@ _count="$(mock_call_count efibootmgr)"
 assert_eq "EFIRT absent -> efibootmgr not called" "${_count}" "0"
 # Restore for any subsequent tests
 _EFI_DEV_EFI=/dev/null
+
+# Test 8: FreeBSD owned the fallback (fallback_is_freebsd=1) -> Guard 1 fires,
+# efibootmgr not called at all, even when no named FreeBSD entry exists.
+# This covers the scenario where Guard 1 supersedes position-preservation logic:
+# when the system boots correctly via the FreeBSD-owned fallback, no write
+# of any kind should happen.
+: > "${MOCK_CALL_LOG}"
+mock_cmd efibootmgr "cat \"${FIXTURES_DIR}/efibootmgr_fallback_only.txt\""
+hash -r 2>/dev/null || true
+_EFI_DEV_EFI=/dev/null
+EFI_DRY_RUN=0
+efi_ensure_nvram_entry "${_ESP_MOUNT}" "${_LOADER_ABS}" \
+    "BOOTx64.efi" "1" 2>/dev/null
+_count="$(mock_call_count efibootmgr)"
+assert_eq \
+    "Guard 1 (fallback-only scenario): efibootmgr not called when FreeBSD owns fallback" \
+    "${_count}" "0"
+
+# Test 9: Another OS owned the fallback (fallback_is_freebsd=0) ->
+# new entry appended to end of BootOrder.
+# Mock sequence: call 1 = pre-create query (no_freebsd: BootOrder 0001,0000,
+# Boot0001→Windows); call 2 = create (exit 0); call 3 = post-create read
+# (after_create_0005 adjusted: BootOrder 0005,0001,0000); call 4 = -o.
+# Expected -o argument: "0001,0000,0005" (new entry at the end).
+: > "${MOCK_CALL_LOG}"
+cat > "${MOCK_BIN}/efibootmgr" << MOCK_EOF
+#!/bin/sh
+echo "efibootmgr \$*" >> "\${MOCK_CALL_LOG}"
+_n=\$(grep -c "^efibootmgr" "\${MOCK_CALL_LOG}" 2>/dev/null || echo 0)
+case "\${_n}" in
+    1) cat "${FIXTURES_DIR}/efibootmgr_no_freebsd.txt" ; exit 0 ;;
+    2) exit 0 ;;
+    3) printf 'BootOrder  : 0005, 0001, 0000\n' ; exit 0 ;;
+    *) exit 0 ;;
+esac
+MOCK_EOF
+chmod +x "${MOCK_BIN}/efibootmgr"
+hash -r 2>/dev/null || true
+EFI_DRY_RUN=0
+efi_ensure_nvram_entry "${_ESP_MOUNT}" "${_LOADER_ABS}" \
+    "BOOTx64.efi" "0" 2>/dev/null
+_o_args=$(grep "^efibootmgr" "${MOCK_CALL_LOG}" | grep -- " -o " | \
+    head -1 | sed "s/^efibootmgr //")
+assert_contains \
+    "Non-FreeBSD fallback: new entry appended to end (0001,0000,0005)" \
+    "${_o_args}" "0001,0000,0005"
+
+# Test 10: Guard 1 — fallback_is_freebsd=1 -> efibootmgr not called at all
+# When the fallback binary (BOOTx64.efi) belongs to FreeBSD, the system
+# already boots correctly via that path.  Guard 1 must fire before the
+# efibootmgr -v query so the firmware is never touched.
+: > "${MOCK_CALL_LOG}"
+mock_cmd efibootmgr "cat \"${FIXTURES_DIR}/efibootmgr_no_freebsd.txt\""
+hash -r 2>/dev/null || true
+EFI_DRY_RUN=0
+_EFI_DEV_EFI=/dev/null
+efi_ensure_nvram_entry "${_ESP_MOUNT}" "${_LOADER_ABS}" "BOOTx64.efi" "1" 2>/dev/null
+_count="$(mock_call_count efibootmgr)"
+assert_eq "Guard 1: fallback_is_freebsd=1 -> efibootmgr not called" \
+    "${_count}" "0"
+
+# Test 11: Guard 2 — efibootmgr -v returns no BootOrder line -> no create call
+# When efibootmgr output contains no parseable BootOrder, Guard 2 treats the
+# firmware as potentially unreliable and skips entry creation.  efibootmgr is
+# called exactly once (the -v query) and no create (-a -c) call follows.
+: > "${MOCK_CALL_LOG}"
+cat > "${MOCK_BIN}/efibootmgr" << MOCK_EOF
+#!/bin/sh
+echo "efibootmgr \$*" >> "\${MOCK_CALL_LOG}"
+_n=\$(grep -c "^efibootmgr" "\${MOCK_CALL_LOG}" 2>/dev/null || echo 0)
+if [ "\${_n}" = "1" ]; then
+    printf 'Boot to FW : false\nBootCurrent: 0002\n'
+    exit 0
+fi
+exit 0
+MOCK_EOF
+chmod +x "${MOCK_BIN}/efibootmgr"
+hash -r 2>/dev/null || true
+EFI_DRY_RUN=0
+efi_ensure_nvram_entry "${_ESP_MOUNT}" "${_LOADER_ABS}" "BOOTx64.efi" "0" 2>/dev/null
+_count="$(mock_call_count efibootmgr)"
+assert_eq "Guard 2: no BootOrder in output -> query only, no create (count=1)" \
+    "${_count}" "1"
 
 tap_end
 

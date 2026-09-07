@@ -28,7 +28,7 @@ export EFI_LOADER_SRC
 
 . "${SRC_DIR}/efi_bootloader_update.sh"
 
-tap_begin 9
+tap_begin 10
 
 # Test 1: device not in mount output -> returns empty
 mock_cmd mount "cat \"${FIXTURES_DIR}/mount_no_esp.txt\""
@@ -96,6 +96,17 @@ assert_empty "FreeBSD14+ 'special': device not mounted -> returns empty" "${_res
 mock_cmd mount "cat \"${FIXTURES_DIR}/mount_esp_at_boot_efi_freebsd14.txt\""
 _result="$(efi_esp_mountpoint /dev/nda0p1 2>/dev/null)"
 assert_eq "FreeBSD14+ 'special': device mounted -> returns /boot/efi" "${_result}" "/boot/efi"
+
+# Test 10: nvd/nda symlink alias — kern.cam.nda.nvd_compat=1 creates /dev/nvd0p1
+# as a symlink to /dev/nda0p1.  fstab may reference nvd0p1 while the script
+# discovers nda0p1 as the real device node.  Direct match fails; the realpath
+# third-fallback resolves both sides to /dev/nda0p1 and returns the mountpoint.
+mock_cmd mount "cat \"${FIXTURES_DIR}/mount_esp_nvd_alias.txt\""
+mock_cmd realpath 'echo "/dev/nda0p1"'
+hash -r 2>/dev/null || true
+_result="$(efi_esp_mountpoint /dev/nda0p1 2>/dev/null)"
+assert_eq "nvd/nda symlink alias: realpath resolves nvd0p1 -> nda0p1 -> /boot/efi" \
+    "${_result}" "/boot/efi"
 
 tap_end
 

@@ -64,10 +64,10 @@ ok 2 - EFI/FreeBSD/loader.efi created in fake mountpoint
 ==============================
   Test Run Complete
 ==============================
-  Files run:  43
+  Files run:  47
   Files failed: 0
-  Total tests: 291
-  Passed:  291
+  Total tests: 315
+  Passed:  315
   Failed:  0
   Skipped: 0
 ==============================

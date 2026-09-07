@@ -14,10 +14,10 @@ index 14e522adb1a0..7969f19fc4a1 100644
  .include <bsd.prog.mk>
 diff --git a/usr.sbin/freebsd-update/efi_bootloader_update.sh b/usr.sbin/freebsd-update/efi_bootloader_update.sh
 new file mode 100644
-index 000000000000..6ac8ea797c89
+index 000000000000..ce40ca71aad3
 --- /dev/null
 +++ b/usr.sbin/freebsd-update/efi_bootloader_update.sh
-@@ -0,0 +1,1325 @@
+@@ -0,0 +1,1485 @@
 +#!/bin/sh
 +#
 +# SPDX-License-Identifier: BSD-2-Clause
@@ -54,6 +54,12 @@ index 000000000000..6ac8ea797c89
 +# Directory containing geom_diskid(4) provider device nodes.  Overridable in
 +# tests to point at a temporary directory populated with stub files.
 +: "${_EFI_DISKID_DEV:=/dev/diskid}"
++
++# Source binary for the 32-bit EFI fallback loader.  Present only on amd64
++# with FreeBSD 14.3 and later; absent on 13.x and 14.0-14.2.  The existence
++# check in efi_update_esp is the sole detection mechanism — no firmware probing
++# is required.  Set to an empty string or a non-existent path to disable.
++: "${_EFI_LOADER_IA32_SRC:=/boot/loader_ia32.efi}"
 +
 +# ============================================================
 +# LOGGING
@@ -161,9 +167,10 @@ index 000000000000..6ac8ea797c89
 +
 +# Internal helper: emit gpart partition data for a disk in line-per-field format.
 +#
-+# Tries "gpart show -p --libxo json" first (FreeBSD 14.x+, where --libxo is
-+# available).  Falls back to "gpart show -p" text parsing on FreeBSD 13.x and
-+# earlier, which do not support --libxo.  Either way the output is the same
++# Tries "gpart show -p --libxo json" first.  Falls back to "gpart show -p"
++# text parsing when --libxo is unavailable (observed on 14.0 and 14.3 as well
++# as 13.x; --libxo appears reliable from 15.x onward).  Either way the output
++# is the same
 +# set of lines that the callers' awk scripts already parse:
 +#   "scheme":"GPT"   (or MBR)
 +#   "index":N
@@ -180,8 +187,8 @@ index 000000000000..6ac8ea797c89
 +        printf '%s\n' "$out" | tr ',{}[]' '\n'
 +        return 0
 +    fi
-+    # FreeBSD 13.x text-mode fallback (--libxo not supported)
-+    _efi_verb "gpart --libxo unavailable for ${disk}; using text-mode fallback (FreeBSD 13.x)"
++    # text-mode fallback (--libxo unavailable)
++    _efi_verb "gpart --libxo unavailable for ${disk}; using text-mode fallback"
 +    gpart show -p "$disk" 2>/dev/null | awk '
 +        {
 +            for (i = 1; i <= NF; i++)
@@ -787,6 +794,27 @@ index 000000000000..6ac8ea797c89
 +            awk -v l="$lbl" '$1 == l { print $NF; exit }')
 +        [ "$component" = "$dev_base" ] && { echo "$node"; break; }
 +    done)
++    [ -n "$result" ] && { echo "$result"; return; }
++
++    # Third: symlink resolution via realpath.  kern.cam.nda.nvd_compat=1 creates
++    # /dev/nvd0pN as a symlink to /dev/nda0pN.  fstab may reference the nvd
++    # alias while the script discovers the real nda device, causing the direct
++    # match above to fail.  Resolve both sides through realpath and compare.
++    local dev_real
++    dev_real=$(realpath "$device" 2>/dev/null) || dev_real="$device"
++    result=$(printf '%s\n' "$mount_json" | tr '}' '\n' | awk -F'"' '
++        {
++            special = ""; node = ""
++            for (i = 1; i <= NF; i++) {
++                if ($i == "special") special = $(i+2)
++                if ($i == "node") node = $(i+2)
++            }
++            if (special ~ "^/dev/" && node != "") print special " " node
++        }
++    ' | while read -r special node; do
++        real=$(realpath "$special" 2>/dev/null) || real="$special"
++        [ "$real" = "$dev_real" ] && { echo "$node"; break; }
++    done)
 +    [ -n "$result" ] && echo "$result"
 +}
 +
@@ -873,12 +901,14 @@ index 000000000000..6ac8ea797c89
 +# Returns 0 if the given file appears to be a FreeBSD EFI loader binary.
 +#
 +# Primary check: bootprog_info string embedded by newvers.sh in all FreeBSD
-+# loaders since FreeBSD 11 — "FreeBSD/<arch> EFI, Revision N.N".  This
-+# pattern is specific enough to eliminate false positives from other OSes.
++# loaders.  FreeBSD 14.0+ uses "FreeBSD/<arch> EFI loader, Revision N.N";
++# older builds used "FreeBSD/<arch> EFI, Revision N.N".  The pattern matches
++# both: "EFI " (space before "loader,") and "EFI," (comma immediately after).
++# Specific enough to eliminate false positives from other OSes.
 +#
 +# Fallback: multi-string heuristic requiring _EFI_FINGERPRINT_THRESHOLD of
-+# "FreeBSD", "loader.efi", "boot/lua" — covers older binaries that predate
-+# the bootprog_info format.
++# "FreeBSD", "loader.efi", "boot/lua" — covers binaries where the primary
++# pattern does not match.
 +efi_is_freebsd_loader() {
 +    local file="$1"
 +
@@ -886,7 +916,7 @@ index 000000000000..6ac8ea797c89
 +    [ -s "$file" ] || return 1   # must be non-empty
 +
 +    # Primary: match the bootprog_info pattern.
-+    if strings "$file" 2>/dev/null | grep -qE 'FreeBSD/[^ ]+ EFI,'; then
++    if strings "$file" 2>/dev/null | grep -qE 'FreeBSD/[^ ]+ EFI[ ,]'; then
 +        _efi_verb "Fingerprint '${file}': bootprog_info match"
 +        return 0
 +    fi
@@ -996,9 +1026,16 @@ index 000000000000..6ac8ea797c89
 +# Non-fatal: many systems boot fine without an explicit NVRAM entry (fallback
 +# path covers them), efibootmgr may not be installed, or EFIRT (/dev/efi) may
 +# be unavailable (custom kernel without options EFIRT, or i386/armv7/riscv64).
++#
++# When creating a new entry, preserves the user's existing BootOrder rather
++# than blindly prepending: if the fallback binary on this ESP belonged to
++# FreeBSD (fallback_is_freebsd=1), the new entry is inserted at the same
++# ordinal position the fallback held.  Otherwise it is appended to the end.
 +efi_ensure_nvram_entry() {
 +    local esp_mount="$1"
 +    local freebsd_loader_abs="$2"  # absolute path on mounted ESP
++    local fallback_binary="${3:-}"       # e.g. BOOTx64.efi
++    local fallback_is_freebsd="${4:-0}"  # 1 if fallback file belongs to FreeBSD
 +
 +    if [ "${EFI_NVRAM_UPDATE}" != "1" ]; then
 +        _efi_verb "EFI_NVRAM_UPDATE=0 — skipping NVRAM boot entry management"
@@ -1015,19 +1052,60 @@ index 000000000000..6ac8ea797c89
 +        return 0
 +    }
 +
++    # Guard 1: if the fallback binary (BOOTx64.efi / bootia32.efi) already
++    # belongs to FreeBSD, the system boots correctly via that path.  Skip
++    # NVRAM entry creation — no write, no risk to fragile firmware.
++    if [ "${fallback_is_freebsd}" = "1" ]; then
++        _efi_verb "Fallback EFI binary is a FreeBSD loader — skipping NVRAM entry creation"
++        return 0
++    fi
++
 +    # Derive EFI-style path (relative to ESP root, backslashes)
 +    local rel_path="${freebsd_loader_abs#${esp_mount}}"
 +    local efi_path
 +    efi_path=$(echo "$rel_path" | tr '/' '\\')
 +
-+    # Look for an existing FreeBSD entry that references /EFI/FreeBSD/loader.efi
-+    local existing
-+    existing=$(efibootmgr -v 2>/dev/null | \
++    # Single efibootmgr call: check for an existing FreeBSD entry AND capture
++    # the current BootOrder for position logic below.
++    local _efibm_out _existing _boot_order
++    _efibm_out=$(efibootmgr -v 2>/dev/null)
++    _existing=$(printf '%s\n' "$_efibm_out" | \
 +        grep -i "FreeBSD" | grep -i "loader\.efi") || true
 +
-+    if [ -n "$existing" ]; then
++    if [ -n "$_existing" ]; then
 +        _efi_verb "NVRAM FreeBSD entry already exists"
 +        return 0
++    fi
++
++    _boot_order=$(printf '%s\n' "$_efibm_out" | awk '/^BootOrder[[:space:]]*:/{
++        sub(/^BootOrder[[:space:]]*:[[:space:]]*/,"")
++        gsub(/,[[:space:]]*/," ")
++        gsub(/[[:space:]]*$/,"")
++        print; exit}')
++
++    # Guard 2: if efibootmgr returned no parseable BootOrder, the firmware's
++    # NVRAM implementation may be unreliable (e.g. early UEFI era boards with
++    # broken SetVariable).  Skip creation rather than risk a bad write.
++    if [ -z "${_boot_order}" ]; then
++        _efi_verb "efibootmgr returned no parseable BootOrder — skipping NVRAM entry creation"
++        return 0
++    fi
++
++    # If the fallback belongs to FreeBSD, find its ordinal position in
++    # BootOrder so the new entry lands in the same slot (preserving the
++    # user's boot priority).  Otherwise the new entry is appended.
++    local _insert_pos=""
++    if [ "$fallback_is_freebsd" = "1" ] && [ -n "$fallback_binary" ] && \
++       [ -n "$_boot_order" ]; then
++        local _pos=0 _bnum
++        for _bnum in $_boot_order; do
++            if printf '%s\n' "$_efibm_out" | grep -i "Boot${_bnum}[* ]" | \
++               grep -qi "$fallback_binary"; then
++                _insert_pos="$_pos"
++                break
++            fi
++            _pos=$((_pos + 1))
++        done
 +    fi
 +
 +    _efi_info "Adding NVRAM boot entry: FreeBSD → ${efi_path}"
@@ -1045,6 +1123,43 @@ index 000000000000..6ac8ea797c89
 +        return 0   # still non-fatal
 +    }
 +    _efi_info "NVRAM boot entry created"
++
++    # Restore BootOrder with the new entry at the correct position.
++    # Skip if we have no baseline (cannot determine where to insert).
++    [ -n "$_boot_order" ] || return 0
++
++    local _new_order _new_num
++    _new_order=$(efibootmgr 2>/dev/null | awk '/^BootOrder[[:space:]]*:/{
++        sub(/^BootOrder[[:space:]]*:[[:space:]]*/,"")
++        gsub(/,[[:space:]]*/," ")
++        gsub(/[[:space:]]*$/,"")
++        print; exit}')
++
++    # The new entry was prepended by efibootmgr -c; it is the first entry in
++    # _new_order that was absent from _boot_order.
++    _new_num=$(for _n in $_new_order; do
++        _found=0
++        for _o in $_boot_order; do [ "$_n" = "$_o" ] && _found=1 && break; done
++        [ "$_found" = "0" ] && echo "$_n" && break
++    done)
++
++    [ -n "$_new_num" ] || return 0
++
++    # Build the corrected BootOrder.
++    local _rebuilt="" _pos=0 _bnum _inserted=0
++    for _bnum in $_boot_order; do
++        if [ -n "$_insert_pos" ] && [ "$_pos" = "$_insert_pos" ] && \
++           [ "$_inserted" = "0" ]; then
++            _rebuilt="${_rebuilt:+${_rebuilt},}${_new_num}"
++            _inserted=1
++        fi
++        _rebuilt="${_rebuilt:+${_rebuilt},}${_bnum}"
++        _pos=$((_pos + 1))
++    done
++    [ "$_inserted" = "0" ] && _rebuilt="${_rebuilt:+${_rebuilt},}${_new_num}"
++
++    efibootmgr -o "$_rebuilt" >/dev/null 2>&1 || \
++        _efi_warn "efibootmgr: could not set BootOrder — entry created but order not adjusted"
 +}
 +
 +# Update all FreeBSD EFI loaders on a mounted ESP, and create the
@@ -1061,7 +1176,7 @@ index 000000000000..6ac8ea797c89
 +        *)   device="/dev/${disk}p${part_index}" ;;
 +    esac
 +
-+    local updated=0 errors=0
++    local updated=0 errors=0 fallback_is_freebsd=0
 +
 +    if [ "${EFI_DRY_RUN}" = "1" ] && [ "${_efi_esp_is_real:-0}" != "1" ]; then
 +        _efi_info "[DRY RUN] ESP not mounted — existing file/directory detection skipped; output reflects a blank ESP"
@@ -1118,6 +1233,7 @@ index 000000000000..6ac8ea797c89
 +
 +    if [ -n "$fallback_file" ]; then
 +        if efi_is_freebsd_loader "$fallback_file"; then
++            fallback_is_freebsd=1
 +            efi_safe_copy "${EFI_LOADER_SRC}" "$fallback_file" || errors=$((errors + 1))
 +            [ "${_efi_copy_wrote:-0}" = "1" ] && updated=$((updated + 1))
 +        else
@@ -1143,8 +1259,52 @@ index 000000000000..6ac8ea797c89
 +        fi
 +    fi
 +
++    # ── 2b. ia32 fallback binary: /EFI/BOOT/BOOTia32.efi ─────────────────────
++    #
++    # amd64 + FreeBSD 14.3+ only: /boot/loader_ia32.efi is present when the
++    # running system can support 32-bit UEFI firmware.  The existence check is
++    # the sole detection mechanism — no firmware probing is needed or performed.
++    # On FreeBSD 13.x and 14.0-14.2 the source file is absent; this block is
++    # skipped silently.  NVRAM entry management is not attempted here: EFIRT
++    # is unavailable on 32-bit UEFI firmware (no /dev/efi), which is the only
++    # scenario where BOOTia32.efi is the active boot path.
++
++    if [ -f "${_EFI_LOADER_IA32_SRC}" ]; then
++        local ia32_file
++        ia32_file=$(find "$boot_dir" -maxdepth 1 -type f \
++            -iname "BOOTia32.efi" 2>/dev/null | head -1) || true
++
++        if [ -n "$ia32_file" ]; then
++            # Existing BOOTia32.efi — update only if it fingerprints as FreeBSD.
++            if efi_is_freebsd_loader "$ia32_file"; then
++                efi_safe_copy "${_EFI_LOADER_IA32_SRC}" "$ia32_file" || \
++                    errors=$((errors + 1))
++                [ "${_efi_copy_wrote:-0}" = "1" ] && updated=$((updated + 1))
++            else
++                _efi_warn "$(basename "$ia32_file") at ${ia32_file} does not fingerprint as FreeBSD — skipping"
++                _efi_warn "Another OS may own this path; manual installation of loader_ia32.efi required"
++            fi
++        else
++            # No BOOTia32.efi present — install it.
++            local ia32_dst="${boot_dir}/BOOTia32.efi"
++            _efi_info "Installing ia32 fallback loader: ${ia32_dst}"
++            if [ "${EFI_DRY_RUN}" != "1" ]; then
++                mkdir -p "$boot_dir" 2>/dev/null || {
++                    _efi_err "Cannot create directory: ${boot_dir}"
++                    errors=$((errors + 1))
++                }
++            fi
++            if [ "$errors" -eq 0 ]; then
++                efi_safe_copy "${_EFI_LOADER_IA32_SRC}" "$ia32_dst" || \
++                    errors=$((errors + 1))
++                [ "${_efi_copy_wrote:-0}" = "1" ] && updated=$((updated + 1))
++            fi
++        fi
++    fi
++
 +    # ── 3.  NVRAM entry ────────────────────────────────────────────────────────
-+    efi_ensure_nvram_entry "$esp_mount" "$freebsd_loader"
++    efi_ensure_nvram_entry "$esp_mount" "$freebsd_loader" \
++        "$fallback_binary" "$fallback_is_freebsd"
 +
 +    # ── Summary ────────────────────────────────────────────────────────────────
 +    [ "$updated" -gt 0 ] && \
