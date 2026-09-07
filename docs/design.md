@@ -484,6 +484,27 @@ The device path is overridable via `_EFI_DEV_EFI` (defaults to `/dev/efi`),
 which allows tests to inject `/dev/null` (always a character device) to
 exercise the NVRAM code paths on non-FreeBSD test hosts.
 
+**BootOrder position preservation:**
+
+When `efibootmgr -c` creates a new entry it prepends it to `BootOrder` by
+default.  On multiboot systems this would silently promote the new FreeBSD
+entry above entries the user intentionally placed first.
+
+The function avoids this by capturing `BootOrder` before the create call and
+restoring a corrected order afterward using `efibootmgr -o`:
+
+- **Fallback belonged to FreeBSD** (`fallback_is_freebsd=1`): the new entry is
+  inserted at the same ordinal position the fallback held.  If the fallback was
+  first, FreeBSD remains first; if it was second (behind Windows), it stays
+  second.
+- **Fallback belonged to another OS, or no fallback existed**
+  (`fallback_is_freebsd=0`): FreeBSD had no named position in `BootOrder`
+  before; the new entry is appended to the end.
+
+The fallback ownership flag is determined by `efi_update_esp` using the same
+`efi_is_freebsd_loader` fingerprint check that governs whether the fallback
+file is updated at all.  No additional fingerprinting is required.
+
 ### 4.6 ESP Mountpoint Detection and GEOM Label Resolution
 
 `efi_esp_mountpoint` determines whether a given ESP device is already mounted,
@@ -773,32 +794,87 @@ boot failure would affect the wording of the §6.4 and §6.6 notices.
 If you have tested this script in such a configuration, please open an issue at
 the project repository or add a note to [docs/hardware-reports.md](hardware-reports.md).
 
-### 6.8 32-Bit EFI Fallback Binary (`BOOTia32.efi`)
+### 6.8 32-Bit EFI Fallback Binary (`BOOTia32.efi`) (Implemented)
 
-On amd64 systems, some firmware configurations load a 32-bit EFI binary
-(`/EFI/BOOT/BOOTia32.efi`) in addition to the 64-bit binary
-(`/EFI/BOOT/BOOTx64.efi`).  The 32-bit EFI loader for FreeBSD is
-`/boot/loader_ia32.efi`.
+On amd64 systems with 32-bit UEFI firmware (Intel Bay Trail, Braswell, and
+similar), the firmware loads a 32-bit EFI binary (`/EFI/BOOT/BOOTia32.efi`)
+rather than the 64-bit binary (`/EFI/BOOT/BOOTx64.efi`).  The 32-bit EFI
+loader for FreeBSD is `/boot/loader_ia32.efi`.
 
-This script does not update `BOOTia32.efi` because the source file is not
-reliably present:
+**Source binary availability:**
 
 - `/boot/loader_ia32.efi` is only included in the amd64 base distribution on
-  FreeBSD 14.x and later.  It is absent on 13.x and on non-amd64 architectures.
+  FreeBSD 14.3 and later.  It is absent on 13.x, on 14.0–14.2, and on
+  non-amd64 architectures.  32-bit UEFI boot support (commit f8ca5d45c3c1,
+  Ahmad Khalifa, Sept 2024) was added to main and MFC'd to stable/14 in
+  March 2025; 14.3-RELEASE was the first official release to include it.
+  FreeBSD 13.x received no backport.
 - There is no equivalent source binary named `bootia32.efi` in the FreeBSD
   base system; the name `BOOTia32.efi` is the UEFI fallback convention.
 
-The consequence is that on an amd64 system with a 32-bit EFI entry on the ESP,
-`BOOTia32.efi` will not be updated by this script even when
-`/boot/loader_ia32.efi` is available.  The system continues to boot via the
-64-bit path (`BOOTx64.efi` or the NVRAM `EFI/FreeBSD/loader.efi` entry).
+**Implementation:**
 
-**Possible resolution:** Detect `/boot/loader_ia32.efi` and, when present,
-update `BOOTia32.efi` using the same fingerprint-gated safe-copy logic applied
-to the 64-bit fallback.  This requires handling the absent-source case
-gracefully on 13.x and non-amd64 hosts.
+The script detects `/boot/loader_ia32.efi` (configured via
+`_EFI_LOADER_IA32_SRC`).  When the source file is present:
 
-This is tracked as open review item #2 (imp, D58990).
+1. If `/EFI/BOOT/BOOTia32.efi` already exists on the ESP and fingerprints
+   as a FreeBSD loader (primary `bootprog_info` match or heuristic), it is
+   updated with `efi_safe_copy` (the same temp-file + sync + rename approach
+   used for `BOOTx64.efi`).
+
+2. If `/EFI/BOOT/BOOTia32.efi` already exists but does **not** fingerprint
+   as a FreeBSD loader (e.g. Windows Boot Manager, another OS's bootloader),
+   it is left entirely untouched and a WARN is printed.  The Windows binary
+   is preserved; the operator must handle the ia32 path manually.  See
+   [contrib/howto-ia32-uefi-nvram-windows.md](../contrib/howto-ia32-uefi-nvram-windows.md)
+   for the procedure.
+
+3. If `/EFI/BOOT/BOOTia32.efi` does not exist, it is created fresh (same
+   as the fresh-install path for `BOOTx64.efi`).
+
+When the source file is absent (13.x, 14.0–14.2, non-amd64), the entire
+ia32 block is skipped silently.
+
+**NVRAM management on 32-bit UEFI:**
+
+FreeBSD's `efirt(4)` driver cannot attach to 32-bit UEFI runtime services
+from a 64-bit kernel.  This is a fundamental architectural constraint: the
+64-bit kernel cannot call 32-bit UEFI runtime functions.  As a result,
+`/dev/efi` is never created and neither `efibootmgr` nor the script can
+manage NVRAM on this class of hardware.
+
+The NVRAM step is skipped gracefully (same as the `_EFI_DEV_EFI` absent
+path).  The `BOOTia32.efi` fallback binary — updated by this script — is the
+primary boot path on these systems.  On firmware that respects the UEFI
+fallback path, FreeBSD boots automatically after the ESP is updated.
+
+On OEM Bay Trail firmware that ignores the UEFI `BootOrder` variable or
+hardcodes the boot path, a one-time manual NVRAM setup is required.  See
+[contrib/howto-ia32-uefi-nvram-windows.md](../contrib/howto-ia32-uefi-nvram-windows.md)
+for three documented scenarios (standard, OEM ignores BootOrder, OEM
+hardcodes path in ROM).
+
+**FreeBSD-EN-25:12.efi:**
+
+FreeBSD 14.3-RELEASE shipped with a bsdinstall bug (FreeBSD-EN-25:12.efi,
+fixed in 14.3-RELEASE-p2) that caused the installer to place only the
+64-bit `loader.efi` in all ESP locations — including `EFI/BOOT/BOOTia32.efi`
+— on amd64 systems.  After applying `freebsd-update` to reach 14.3-RELEASE-p2
+or later, `/boot/loader_ia32.efi` is correctly present.  Running this script
+then updates the ESP to place the ia32 loader in `EFI/BOOT/BOOTia32.efi`.
+
+**Validated on live 32-bit UEFI hardware:**
+
+Tested on a Generic Intel Pocket PC (Atom Z3736F, Bay Trail-CR), 31GB eMMC
+(`mmcsd0`), FreeBSD 14.3-RELEASE amd64.  Confirmed:
+
+- `/dev/efi` absent; `efibootmgr` fails; NVRAM skipped gracefully
+- `gpart --libxo json` fails on eMMC (hardware boot partitions); text-mode
+  fallback (`_efi_gpart_show_norm`) works correctly
+- 310/310 tests pass on live hardware
+- Dry-run: correct output — EFIRT skip, ESP detected, would-update messages
+- `BOOTia32.efi` correctly fingerprinted and updated (or skipped when
+  Windows-owned)
 
 ### 6.9 `gpart show` parsing — `_efi_gpart_show_norm` (Implemented)
 

@@ -1,0 +1,1 @@
+{"mount":{"mounted":[{"special":"zroot/ROOT/default","node":"/","fstype":"zfs","opts":["local","noatime","nfsv4acls"]},{"special":"devfs","node":"/dev","fstype":"devfs","opts":["multilabel"]},{"special":"/dev/nvd0p1","node":"/boot/efi","fstype":"msdosfs","opts":["rw","noexec","nosuid"]}]}}
