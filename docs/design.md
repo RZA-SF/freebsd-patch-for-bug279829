@@ -508,6 +508,30 @@ The fallback ownership flag is determined by `efi_update_esp` using the same
 `efi_is_freebsd_loader` fingerprint check that governs whether the fallback
 file is updated at all.  No additional fingerprinting is required.
 
+**Opt-out: `UpdateBootloaderNVRAM no`**
+
+Administrators who manage NVRAM boot entries externally — via BMC, iDRAC, iLO,
+Ansible, or similar mechanisms — or whose firmware has a fragile `SetVariable`
+implementation can disable NVRAM management persistently without disabling ESP
+file updates:
+
+```
+# /etc/freebsd-update.conf
+UpdateBootloaderNVRAM no
+```
+
+This sets `EFI_NVRAM_UPDATE=0` in the environment before `efi_bootloader_update.sh`
+is sourced, causing `efi_ensure_nvram_entry` to return immediately.  ESP file
+updates (`/EFI/FreeBSD/loader.efi`, `/EFI/BOOT/BOOTx64.efi`) proceed normally.
+
+For a one-off invocation without a conf change:
+```sh
+EFI_NVRAM_UPDATE=0 freebsd-update install
+```
+
+`UpdateBootloader no` remains the option to disable all bootloader updates
+(both ESP files and NVRAM).
+
 ### 4.6 ESP Mountpoint Detection and GEOM Label Resolution
 
 `efi_esp_mountpoint` determines whether a given ESP device is already mounted,
@@ -832,8 +856,26 @@ The script detects `/boot/loader_ia32.efi` (configured via
    [contrib/howto-ia32-uefi-nvram-windows.md](../contrib/howto-ia32-uefi-nvram-windows.md)
    for the procedure.
 
-3. If `/EFI/BOOT/BOOTia32.efi` does not exist, it is created fresh (same
-   as the fresh-install path for `BOOTx64.efi`).
+3. If `/EFI/BOOT/BOOTia32.efi` does not exist, fresh installation is
+   **gated on `EFI_INSTALL_IA32=1`** (default `0`).  The ia32 source binary
+   (`/boot/loader_ia32.efi`) ships on all amd64 14.3+/15.x systems regardless
+   of firmware bitness, so installing it unconditionally would add an
+   unnecessary file to 64-bit UEFI ESPs where the firmware does not use it.
+
+   - With `EFI_INSTALL_IA32=1`: `BOOTia32.efi` is created fresh (same as the
+     fresh-install path for `BOOTx64.efi`).
+   - Without the flag (default): a verbose message is emitted and the file is
+     not created.
+
+   **On `bsdinstall`-provisioned 32-bit UEFI systems** `BOOTia32.efi` is
+   placed by the installer during initial setup, so it is already present and
+   reaches the fingerprint + update path (step 1) on subsequent runs without
+   requiring `EFI_INSTALL_IA32=1`.
+
+   Set `EFI_INSTALL_IA32=1` only when `BOOTia32.efi` is absent but needed:
+   a dual-boot shared Windows ESP where `bsdinstall` could not place the file,
+   or a portable drive intended to boot on both 32-bit and 64-bit UEFI
+   firmware.
 
 When the source file is absent (13.x, 14.0–14.2, non-amd64), the entire
 ia32 block is skipped silently.
@@ -997,13 +1039,29 @@ world-readable by default in the filesystem driver.  The EFI loader binary
 is not a secret, so this is not a concern.  The temp file's existence is
 transient; any failure causes it to be removed.
 
-### 7.5 No Signature Verification
+### 7.5 Secure Boot Signature Guard
 
-This script does not verify GPG or UEFI Secure Boot signatures on the source
-loader.  It trusts that `/boot/loader.efi` (or `EFI_LOADER_SRC`) was
-installed by `freebsd-update` via the signed base distribution, and that
-the overall system integrity is enforced at the `freebsd-update` level.
+Before overwriting an existing EFI binary on the ESP, `efi_safe_copy` checks
+whether it carries an Authenticode / Secure Boot signature using
+`uefisign -V`.  If the destination binary is signed, the copy is skipped and
+a warning is issued.  The signed binary is left in place unchanged.
 
-If Secure Boot is active, the firmware will reject an unsigned loader
-regardless of what this script writes.  The Secure Boot signing infrastructure
-is outside the scope of this script.
+**Rationale:** Replacing a signed loader with an unsigned one on a
+Secure Boot-enabled system causes the firmware to reject it at next boot.
+FreeBSD does not ship signed loaders in the base distribution, so the
+standard case (no signature present) is unaffected.
+
+**Affected scenario:** Administrators who have enrolled a custom Secure Boot
+key and signed their loader with `uefisign(8)` must re-sign
+`/boot/loader.efi` with their enrolled key after each update and copy it to
+the ESP manually, or set `UpdateBootloader no` in `freebsd-update.conf` to
+manage the ESP themselves.
+
+**Source loader:** The script does not verify a GPG or Secure Boot signature
+on the source `/boot/loader.efi`.  It trusts that `freebsd-update` delivered
+it from the signed base distribution.
+
+**Fail-open:** If `uefisign(8)` returns a non-zero exit code for any reason
+— including when it is not in PATH — `efi_is_signed` returns 1 (not signed)
+and the copy proceeds.  This preserves normal behaviour on systems that do
+not use Secure Boot signing.

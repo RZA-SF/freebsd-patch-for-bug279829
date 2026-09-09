@@ -2,7 +2,7 @@
 
 This repository contains a patch for `freebsd-update` that automatically updates the EFI bootloader on the ESP (EFI System Partition) during `freebsd-update install`. Without this fix, upgrading FreeBSD across major versions can silently leave a stale bootloader on the ESP — one that cannot boot the newly installed system.
 
-The patch is developed here ahead of submission to the FreeBSD project via Phabricator. It has been tested on real FreeBSD hardware across multiple versions with a 315-test suite covering unit, integration, and error conditions across a broad range of configurations.
+The patch is developed here ahead of submission to the FreeBSD project via Phabricator. It has been tested on real FreeBSD hardware across multiple versions with a 325-test suite covering unit, integration, and error conditions across a broad range of configurations.
 
 **Addresses:** [FreeBSD bug 279829](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=279829)
 **Upstream status:** Closed "Not a bug" — but the underlying hazard is real and ongoing
@@ -13,14 +13,14 @@ The patch is developed here ahead of submission to the FreeBSD project via Phabr
 
 | | |
 |---|---|
-| Test suite | 315 / 315 passing |
+| Test suite | 325 / 325 passing |
 | Live run | ✓ Complete — FreeBSD 14.0-RELEASE-p11, amd64, UEFI, ZFS, NVMe |
-| Phabricator submission | ✓ [D58990](https://reviews.freebsd.org/D58990) — revision-4 uploaded (D58990?id=186193) |
+| Phabricator submission | ✓ [D58990](https://reviews.freebsd.org/D58990) — revision-5 uploaded (D58990?id=186318) |
 | Backport targets | `main` (15-CURRENT), `stable/14`, `stable/13` |
 
 ### Test Suite Run History
 
-315/315 tests passing. Validated across:
+325/325 tests passing. Validated across:
 - **Architectures:** amd64, aarch64
 - **FreeBSD versions:** 13.5, 14.0, 14.3, 14.4, 15.1 (RELEASE and CURRENT)
 - **Root filesystems:** ZFS, UFS
@@ -185,7 +185,7 @@ freebsd-patch-for-bug279829/
 │   │   └── test_helpers.sh             ← TAP assertions and ESP fixtures
 │   ├── fixtures/                        ← Sample command output files
 │   ├── unit/                            ← Unit tests (16 files)
-│   ├── integration/                     ← Integration tests (16 files, includes R-14 split-media guard, ia32 scenarios)
+│   ├── integration/                     ← Integration tests (17 files, includes R-14 split-media guard, ia32 scenarios)
 │   ├── error_conditions/               ← Error/boundary/negative tests (15 files)
 │   └── regression/                      ← Regression index (R-01 through R-14)
 ├── contrib/
@@ -286,8 +286,9 @@ freebsd-update: [bootloader] INFO:  Bootloader update complete
 | `EFI_BIOS_ZFS_BOOT` | `/boot/gptzfsboot` | GPT ZFS boot program |
 | `EFI_BIOS_UFS_BOOT` | `/boot/gptboot` | GPT UFS boot program |
 | `_EFI_LOADER_IA32_SRC` | `/boot/loader_ia32.efi` | Source binary for the 32-bit EFI fallback loader (amd64 14.3+ only; absent on 13.x and 14.0–14.2; skip if not present). Leading underscore denotes an override variable — not part of the primary public interface. |
+| `EFI_INSTALL_IA32` | `0` | Set to `1` to install `BOOTia32.efi` fresh onto an ESP that does not already have one. Use on a dual-boot shared Windows ESP or a portable drive that must boot on both 32-bit and 64-bit UEFI firmware. On systems provisioned by `bsdinstall`, `BOOTia32.efi` is placed by the installer and updated automatically without this flag. |
 
-The hook as a whole can be disabled via `UpdateBootloader no` in `freebsd-update.conf`.
+To skip only NVRAM boot entry management while still updating ESP files, set `UpdateBootloaderNVRAM no` in `freebsd-update.conf` (use when NVRAM entries are managed externally via BMC, Ansible, etc.). To disable all bootloader updates, set `UpdateBootloader no` — this also skips NVRAM.
 
 ---
 
@@ -331,6 +332,7 @@ That hook is out of scope for this patch and would be a separate pkgbase contrib
 
 - **Hardware RAID**: Physical disk devices are not visible through the RAID controller. The script prints a warning and instructs manual update.
 - **Encrypted ESP**: Extremely rare; not supported. The mount fails with a generic error and the partition is skipped.
+- **Secure Boot (signed loaders)**: If an existing EFI binary on the ESP carries an Authenticode / Secure Boot signature, it is left untouched and a warning is printed. Administrators managing signed loaders must re-sign `/boot/loader.efi` with their enrolled key after each update and copy it to the ESP manually, or set `UpdateBootloader no` in `freebsd-update.conf`.
 - **MBR (non-GPT) disks**: Supported. ESP detected by gpart type names `fat32lba` (0x0C), `fat32` (0x0B), and `efi` (0xEF). MBR device paths use the `s` suffix (e.g. `/dev/da0s1`). Safety: the MBR FAT32 partition is only written if `efi_is_freebsd_loader` confirms a FreeBSD loader signature is present (fingerprint-gated, prevents overwriting U-Boot or other bootloaders on embedded systems).
 - **FAT32 atomicity**: `mv` on FAT32 is not truly atomic. A power failure between the `cp` and `mv` could leave the ESP in an inconsistent state. The temp-file approach minimises the window but cannot eliminate the risk entirely. This is inherent to any ESP update operation.
 - **BootCurrent unavailable**: Some firmware (notably certain ARM platforms) does not expose full NVRAM boot entries via `efibootmgr`. The script falls back to the root-filesystem-disk heuristic automatically.

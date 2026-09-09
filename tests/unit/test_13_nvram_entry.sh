@@ -38,7 +38,7 @@ export EFI_LOADER_SRC
 _ESP_MOUNT="/tmp/esp_test"
 _LOADER_ABS="${_ESP_MOUNT}/EFI/FreeBSD/loader.efi"
 
-tap_begin 12
+tap_begin 14
 
 # Simulate EFIRT available for all tests except the EFIRT-absent test.
 _EFI_DEV_EFI=/dev/null
@@ -223,6 +223,26 @@ efi_ensure_nvram_entry "${_ESP_MOUNT}" "${_LOADER_ABS}" "BOOTx64.efi" "0" 2>/dev
 _count="$(mock_call_count efibootmgr)"
 assert_eq "Guard 2: no BootOrder in output -> query only, no create (count=1)" \
     "${_count}" "1"
+
+# Test 12-13: EFI_NVRAM_UPDATE=0 -> returns 0, efibootmgr not called
+# Verifies that setting EFI_NVRAM_UPDATE=0 (e.g. via UpdateBootloaderNVRAM no
+# in freebsd-update.conf) causes efi_ensure_nvram_entry to return immediately
+# without calling efibootmgr at all.
+: > "${MOCK_CALL_LOG}"
+cat > "${MOCK_BIN}/efibootmgr" << MOCK_EOF
+#!/bin/sh
+echo "efibootmgr \$*" >> "\${MOCK_CALL_LOG}"
+exit 0
+MOCK_EOF
+chmod +x "${MOCK_BIN}/efibootmgr"
+hash -r 2>/dev/null || true
+EFI_NVRAM_UPDATE=0
+efi_ensure_nvram_entry "${_ESP_MOUNT}" "${_LOADER_ABS}" "BOOTx64.efi" "0" 2>/dev/null
+_rc=$?
+_count="$(mock_call_count efibootmgr)"
+unset EFI_NVRAM_UPDATE
+assert_eq "EFI_NVRAM_UPDATE=0 -> returns 0" "${_rc}" "0"
+assert_eq "EFI_NVRAM_UPDATE=0 -> efibootmgr not called" "${_count}" "0"
 
 tap_end
 
