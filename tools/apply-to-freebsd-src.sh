@@ -55,30 +55,35 @@ awk '
 mv "${TARGET}/Makefile.new" "${TARGET}/Makefile"
 
 # ── 2. freebsd-update.conf ───────────────────────────────────────────────────
-echo "--> freebsd-update.conf: adding UpdateBootloader option"
+echo "--> freebsd-update.conf: adding UpdateBootloader and UpdateBootloaderNVRAM options"
 cat >> "${TARGET}/freebsd-update.conf" << 'EOF'
 
 # Automatically update the EFI bootloader on the ESP and BIOS bootcode on
 # freebsd-boot partitions when installing updates.  Disable only if you manage
 # bootloaders manually or use a custom boot configuration.
 # UpdateBootloader yes
+
+# Set to no to skip NVRAM boot entry management while still updating ESP files.
+# Use when NVRAM entries are managed externally (BMC, Ansible, iDRAC, etc.) or
+# when the firmware's SetVariable implementation is unreliable.
+# UpdateBootloaderNVRAM yes
 EOF
 
 # ── 3. freebsd-update.sh — CONFIGOPTIONS ─────────────────────────────────────
-echo "--> freebsd-update.sh: adding UPDATEBOOTLOADER to CONFIGOPTIONS"
+echo "--> freebsd-update.sh: adding UPDATEBOOTLOADER and UPDATEBOOTLOADERNVRAM to CONFIGOPTIONS"
 awk '
 /IDSIGNOREPATHS BACKUPKERNEL BACKUPKERNELDIR BACKUPKERNELSYMBOLFILES"/ {
     sub(/"$/, " \\")
     print
-    print "    UPDATEBOOTLOADER\""
+    print "    UPDATEBOOTLOADER UPDATEBOOTLOADERNVRAM\""
     next
 }
 { print }
 ' "${TARGET}/freebsd-update.sh" > "${TARGET}/freebsd-update.sh.new"
 mv "${TARGET}/freebsd-update.sh.new" "${TARGET}/freebsd-update.sh"
 
-# ── 4. freebsd-update.sh — config_UpdateBootloader() ─────────────────────────
-echo "--> freebsd-update.sh: adding config_UpdateBootloader function"
+# ── 4. freebsd-update.sh — config_UpdateBootloader() + config_UpdateBootloaderNVRAM() ──
+echo "--> freebsd-update.sh: adding config_UpdateBootloader and config_UpdateBootloaderNVRAM functions"
 awk '
 /^# Handle one line of configuration$/ && !done {
     print "config_UpdateBootloader () {"
@@ -99,6 +104,24 @@ awk '
     print "\tfi"
     print "}"
     print ""
+    print "config_UpdateBootloaderNVRAM () {"
+    print "\tif [ -z ${UPDATEBOOTLOADERNVRAM} ]; then"
+    print "\t\tcase $1 in"
+    print "\t\t[Yy][Ee][Ss])"
+    print "\t\t\tUPDATEBOOTLOADERNVRAM=yes"
+    print "\t\t\t;;"
+    print "\t\t[Nn][Oo])"
+    print "\t\t\tUPDATEBOOTLOADERNVRAM=no"
+    print "\t\t\t;;"
+    print "\t\t*)"
+    print "\t\t\treturn 1"
+    print "\t\t\t;;"
+    print "\t\tesac"
+    print "\telse"
+    print "\t\treturn 1"
+    print "\tfi"
+    print "}"
+    print ""
     done=1
 }
 { print }
@@ -106,11 +129,12 @@ awk '
 mv "${TARGET}/freebsd-update.sh.new" "${TARGET}/freebsd-update.sh"
 
 # ── 5. freebsd-update.sh — default config ────────────────────────────────────
-echo "--> freebsd-update.sh: adding default config_UpdateBootloader yes"
+echo "--> freebsd-update.sh: adding default config_UpdateBootloader yes and config_UpdateBootloaderNVRAM yes"
 awk '
 /^\tconfig_CreateBootEnv yes$/ && !done {
     print
     print "\tconfig_UpdateBootloader yes"
+    print "\tconfig_UpdateBootloaderNVRAM yes"
     done=1
     next
 }
@@ -128,6 +152,11 @@ awk '
     print "update_bootloaders_after_install () {"
     print "\tif [ \"${UPDATEBOOTLOADER}\" = \"no\" ]; then"
     print "\t\treturn 0"
+    print "\tfi"
+    print ""
+    print "\tif [ \"${UPDATEBOOTLOADERNVRAM}\" = \"no\" ]; then"
+    print "\t\tEFI_NVRAM_UPDATE=0"
+    print "\t\texport EFI_NVRAM_UPDATE"
     print "\tfi"
     print ""
     print "\t_efi_lib=\"${BASEDIR}/usr/libexec/efi_bootloader_update.sh\""
@@ -175,7 +204,19 @@ awk '
     print "installed"
     print ".Pa /boot/loader.efi"
     print "and Lua scripts, preventing boot failures after major version upgrades."
-    print "To disable, set"
+    print "EFI binaries that carry a Secure Boot signature are not overwritten;"
+    print "a warning is emitted and the signed binary is left unchanged."
+    print "To skip only NVRAM boot entry management while still updating ESP files,"
+    print "set"
+    print ".Cm UpdateBootloaderNVRAM no"
+    print "in"
+    print ".Xr freebsd-update.conf 5 ."
+    print "This is appropriate when NVRAM entries are managed externally"
+    print "(for example, via a BMC or configuration management system)"
+    print "or when the firmware\\(aqs"
+    print ".Dv SetVariable"
+    print "implementation is unreliable."
+    print "To disable bootloader updates entirely, set"
     print ".Cm UpdateBootloader no"
     print "in"
     print ".Xr freebsd-update.conf 5 ."

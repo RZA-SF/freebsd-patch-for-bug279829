@@ -14,10 +14,10 @@ index 14e522adb1a0..7969f19fc4a1 100644
  .include <bsd.prog.mk>
 diff --git a/usr.sbin/freebsd-update/efi_bootloader_update.sh b/usr.sbin/freebsd-update/efi_bootloader_update.sh
 new file mode 100644
-index 000000000000..ce40ca71aad3
+index 000000000000..4896ff6e567d
 --- /dev/null
 +++ b/usr.sbin/freebsd-update/efi_bootloader_update.sh
-@@ -0,0 +1,1485 @@
+@@ -0,0 +1,1535 @@
 +#!/bin/sh
 +#
 +# SPDX-License-Identifier: BSD-2-Clause
@@ -60,6 +60,23 @@ index 000000000000..ce40ca71aad3
 +# check in efi_update_esp is the sole detection mechanism — no firmware probing
 +# is required.  Set to an empty string or a non-existent path to disable.
 +: "${_EFI_LOADER_IA32_SRC:=/boot/loader_ia32.efi}"
++
++# Controls fresh installation of BOOTia32.efi onto an ESP that does not already
++# have one.  Defaults to 0 (disabled).
++#
++# On a system installed via bsdinstall, BOOTia32.efi is already present on the
++# ESP (bsdinstall creates it for 32-bit UEFI targets); this script then updates
++# it via the normal fingerprint-and-copy path without requiring this flag.  The
++# ia32 source binary (/boot/loader_ia32.efi) ships on all amd64 14.3+/15.x
++# systems regardless of firmware bitness, so installing it unconditionally would
++# add an unnecessary file to 64-bit UEFI ESPs.
++#
++# Set to 1 only when BOOTia32.efi is missing from the ESP but is needed:
++#   - Dual-boot with a shared Windows ESP where bsdinstall could not place it
++#   - Provisioning a portable drive that must boot on both 32-bit and 64-bit UEFI
++# When an existing FreeBSD-owned BOOTia32.efi is already present, it is always
++# updated regardless of this setting.
++: "${EFI_INSTALL_IA32:=0}"
 +
 +# ============================================================
 +# LOGGING
@@ -932,6 +949,19 @@ index 000000000000..ce40ca71aad3
 +    [ "$matches" -ge "${_EFI_FINGERPRINT_THRESHOLD}" ]
 +}
 +
++# Returns 0 if the given EFI binary carries an Authenticode / Secure Boot
++# signature, 1 otherwise.  Uses uefisign(8) -V, available in FreeBSD base
++# since 10.x.  Returns 1 (not signed) if the file is absent, empty, or if
++# uefisign returns a non-zero exit code for any reason — including when it is
++# not in PATH.  This fail-open default preserves normal copy behaviour on
++# systems that do not use Secure Boot signing.
++efi_is_signed() {
++    local file="$1"
++    [ -f "$file" ] || return 1
++    [ -s "$file" ] || return 1
++    uefisign -V "$file" >/dev/null 2>&1
++}
++
 +# ============================================================
 +# SPACE CHECK
 +# ============================================================
@@ -996,6 +1026,17 @@ index 000000000000..ce40ca71aad3
 +    # Avoids unnecessary FAT32 writes on repeated freebsd-update install runs.
 +    if [ -f "$dst" ] && cmp -s "$src" "$dst" 2>/dev/null; then
 +        _efi_verb "Already up to date: ${dst}"
++        return 0
++    fi
++
++    # Refuse to overwrite a signed binary with an unsigned one.
++    # On a Secure Boot-enabled system, replacing a signed loader with an
++    # unsigned /boot/loader.efi would cause the firmware to reject it at
++    # next boot.  Leave the signed binary in place and warn; the operator
++    # must re-sign /boot/loader.efi with their enrolled key and copy manually.
++    if [ -f "$dst" ] && efi_is_signed "$dst"; then
++        _efi_warn "Skipping ${dst}: existing binary carries a Secure Boot signature"
++        _efi_warn "Re-sign /boot/loader.efi with your enrolled key and copy to the ESP manually"
 +        return 0
 +    fi
 +
@@ -1285,19 +1326,28 @@ index 000000000000..ce40ca71aad3
 +                _efi_warn "Another OS may own this path; manual installation of loader_ia32.efi required"
 +            fi
 +        else
-+            # No BOOTia32.efi present — install it.
-+            local ia32_dst="${boot_dir}/BOOTia32.efi"
-+            _efi_info "Installing ia32 fallback loader: ${ia32_dst}"
-+            if [ "${EFI_DRY_RUN}" != "1" ]; then
-+                mkdir -p "$boot_dir" 2>/dev/null || {
-+                    _efi_err "Cannot create directory: ${boot_dir}"
-+                    errors=$((errors + 1))
-+                }
-+            fi
-+            if [ "$errors" -eq 0 ]; then
-+                efi_safe_copy "${_EFI_LOADER_IA32_SRC}" "$ia32_dst" || \
-+                    errors=$((errors + 1))
-+                [ "${_efi_copy_wrote:-0}" = "1" ] && updated=$((updated + 1))
++            # No BOOTia32.efi present.  Only install fresh when EFI_INSTALL_IA32=1.
++            # On a bsdinstall-provisioned 32-bit UEFI system BOOTia32.efi is
++            # already on the ESP and is handled by the update path above.
++            # Installing without an explicit opt-in would add an unnecessary file
++            # to 64-bit UEFI ESPs where the ia32 source binary ships but is not
++            # needed by the firmware.
++            if [ "${EFI_INSTALL_IA32:-0}" = "1" ]; then
++                local ia32_dst="${boot_dir}/BOOTia32.efi"
++                _efi_info "Installing ia32 fallback loader: ${ia32_dst}"
++                if [ "${EFI_DRY_RUN}" != "1" ]; then
++                    mkdir -p "$boot_dir" 2>/dev/null || {
++                        _efi_err "Cannot create directory: ${boot_dir}"
++                        errors=$((errors + 1))
++                    }
++                fi
++                if [ "$errors" -eq 0 ]; then
++                    efi_safe_copy "${_EFI_LOADER_IA32_SRC}" "$ia32_dst" || \
++                        errors=$((errors + 1))
++                    [ "${_efi_copy_wrote:-0}" = "1" ] && updated=$((updated + 1))
++                fi
++            else
++                _efi_verb "ia32 source present but no BOOTia32.efi on ESP; set EFI_INSTALL_IA32=1 to install"
 +            fi
 +        fi
 +    fi
@@ -1504,10 +1554,10 @@ index 000000000000..ce40ca71aad3
 +    exit $?
 +fi
 diff --git a/usr.sbin/freebsd-update/freebsd-update.8 b/usr.sbin/freebsd-update/freebsd-update.8
-index 0d50ac8822de..c071446bd80b 100644
+index 0d50ac8822de..2cee17e42cca 100644
 --- a/usr.sbin/freebsd-update/freebsd-update.8
 +++ b/usr.sbin/freebsd-update/freebsd-update.8
-@@ -197,6 +197,22 @@ and the
+@@ -197,6 +197,34 @@ and the
  .Cm fetch
  command wasn't passed as an earlier argument in the same
  invocation.
@@ -1523,14 +1573,26 @@ index 0d50ac8822de..c071446bd80b 100644
 +installed
 +.Pa /boot/loader.efi
 +and Lua scripts, preventing boot failures after major version upgrades.
-+To disable, set
++EFI binaries that carry a Secure Boot signature are not overwritten;
++a warning is emitted and the signed binary is left unchanged.
++To skip only NVRAM boot entry management while still updating ESP files,
++set
++.Cm UpdateBootloaderNVRAM no
++in
++.Xr freebsd-update.conf 5 .
++This is appropriate when NVRAM entries are managed externally
++(for example, via a BMC or configuration management system)
++or when the firmware\(aqs
++.Dv SetVariable
++implementation is unreliable.
++To disable bootloader updates entirely, set
 +.Cm UpdateBootloader no
 +in
 +.Xr freebsd-update.conf 5 .
  .It Cm rollback
  Uninstall the most recently installed updates.
  .It Cm IDS
-@@ -256,6 +272,14 @@ All files under
+@@ -256,6 +284,14 @@ All files under
  .Pa /var/db/freebsd-update/
  may be deleted if an upgrade is not in progress and rollback will not be
  required.
@@ -1546,10 +1608,10 @@ index 0d50ac8822de..c071446bd80b 100644
  .Sh SEE ALSO
  .Xr freebsd-version 1 ,
 diff --git a/usr.sbin/freebsd-update/freebsd-update.conf b/usr.sbin/freebsd-update/freebsd-update.conf
-index 08cf512ce144..fc0c22e685ed 100644
+index 08cf512ce144..225032a7a9c9 100644
 --- a/usr.sbin/freebsd-update/freebsd-update.conf
 +++ b/usr.sbin/freebsd-update/freebsd-update.conf
-@@ -76,3 +76,8 @@ MergeChanges /etc/ /boot/device.hints
+@@ -76,3 +76,13 @@ MergeChanges /etc/ /boot/device.hints
  
  # Create a new boot environment when installing patches
  # CreateBootEnv yes
@@ -1558,8 +1620,13 @@ index 08cf512ce144..fc0c22e685ed 100644
 +# freebsd-boot partitions when installing updates.  Disable only if you manage
 +# bootloaders manually or use a custom boot configuration.
 +# UpdateBootloader yes
++
++# Set to no to skip NVRAM boot entry management while still updating ESP files.
++# Use when NVRAM entries are managed externally (BMC, Ansible, iDRAC, etc.) or
++# when the firmware's SetVariable implementation is unreliable.
++# UpdateBootloaderNVRAM yes
 diff --git a/usr.sbin/freebsd-update/freebsd-update.sh b/usr.sbin/freebsd-update/freebsd-update.sh
-index 438e13a51154..e65eac0c13e8 100644
+index 438e13a51154..c139b7159fa1 100644
 --- a/usr.sbin/freebsd-update/freebsd-update.sh
 +++ b/usr.sbin/freebsd-update/freebsd-update.sh
 @@ -97,7 +97,8 @@ EOF
@@ -1568,11 +1635,11 @@ index 438e13a51154..e65eac0c13e8 100644
      BASEDIR VERBOSELEVEL TARGETRELEASE STRICTCOMPONENTS MERGECHANGES
 -    IDSIGNOREPATHS BACKUPKERNEL BACKUPKERNELDIR BACKUPKERNELSYMBOLFILES"
 +    IDSIGNOREPATHS BACKUPKERNEL BACKUPKERNELDIR BACKUPKERNELSYMBOLFILES \
-+    UPDATEBOOTLOADER"
++    UPDATEBOOTLOADER UPDATEBOOTLOADERNVRAM"
  
  # Set all the configuration options to "".
  nullconfig () {
-@@ -439,6 +440,24 @@ config_CreateBootEnv () {
+@@ -439,6 +440,42 @@ config_CreateBootEnv () {
  		return 1
  	fi
  }
@@ -1594,18 +1661,37 @@ index 438e13a51154..e65eac0c13e8 100644
 +	fi
 +}
 +
++config_UpdateBootloaderNVRAM () {
++	if [ -z ${UPDATEBOOTLOADERNVRAM} ]; then
++		case $1 in
++		[Yy][Ee][Ss])
++			UPDATEBOOTLOADERNVRAM=yes
++			;;
++		[Nn][Oo])
++			UPDATEBOOTLOADERNVRAM=no
++			;;
++		*)
++			return 1
++			;;
++		esac
++	else
++		return 1
++	fi
++}
++
  # Handle one line of configuration
  configline () {
  	if [ $# -eq 0 ]; then
-@@ -620,6 +639,7 @@ default_params () {
+@@ -620,6 +657,8 @@ default_params () {
  	config_BackupKernelDir /boot/kernel.old
  	config_BackupKernelSymbolFiles no
  	config_CreateBootEnv yes
 +	config_UpdateBootloader yes
++	config_UpdateBootloaderNVRAM yes
  
  	# Merge these defaults into the earlier-configured settings
  	mergeconfig
-@@ -3141,6 +3161,28 @@ install_setup_rollback () {
+@@ -3141,6 +3180,33 @@ install_setup_rollback () {
  }
  
  # Actually install updates
@@ -1615,6 +1701,11 @@ index 438e13a51154..e65eac0c13e8 100644
 +update_bootloaders_after_install () {
 +	if [ "${UPDATEBOOTLOADER}" = "no" ]; then
 +		return 0
++	fi
++
++	if [ "${UPDATEBOOTLOADERNVRAM}" = "no" ]; then
++		EFI_NVRAM_UPDATE=0
++		export EFI_NVRAM_UPDATE
 +	fi
 +
 +	_efi_lib="${BASEDIR}/usr/libexec/efi_bootloader_update.sh"
@@ -1634,7 +1725,7 @@ index 438e13a51154..e65eac0c13e8 100644
  install_run () {
  	echo -n "Installing updates..."
  
-@@ -3159,6 +3201,10 @@ install_run () {
+@@ -3159,6 +3225,10 @@ install_run () {
  	install_setup_rollback
  
  	echo " done."

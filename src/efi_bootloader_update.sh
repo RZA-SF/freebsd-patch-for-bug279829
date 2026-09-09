@@ -41,6 +41,23 @@ _EFI_FINGERPRINT_THRESHOLD=2
 # is required.  Set to an empty string or a non-existent path to disable.
 : "${_EFI_LOADER_IA32_SRC:=/boot/loader_ia32.efi}"
 
+# Controls fresh installation of BOOTia32.efi onto an ESP that does not already
+# have one.  Defaults to 0 (disabled).
+#
+# On a system installed via bsdinstall, BOOTia32.efi is already present on the
+# ESP (bsdinstall creates it for 32-bit UEFI targets); this script then updates
+# it via the normal fingerprint-and-copy path without requiring this flag.  The
+# ia32 source binary (/boot/loader_ia32.efi) ships on all amd64 14.3+/15.x
+# systems regardless of firmware bitness, so installing it unconditionally would
+# add an unnecessary file to 64-bit UEFI ESPs.
+#
+# Set to 1 only when BOOTia32.efi is missing from the ESP but is needed:
+#   - Dual-boot with a shared Windows ESP where bsdinstall could not place it
+#   - Provisioning a portable drive that must boot on both 32-bit and 64-bit UEFI
+# When an existing FreeBSD-owned BOOTia32.efi is already present, it is always
+# updated regardless of this setting.
+: "${EFI_INSTALL_IA32:=0}"
+
 # ============================================================
 # LOGGING
 # ============================================================
@@ -912,6 +929,19 @@ efi_is_freebsd_loader() {
     [ "$matches" -ge "${_EFI_FINGERPRINT_THRESHOLD}" ]
 }
 
+# Returns 0 if the given EFI binary carries an Authenticode / Secure Boot
+# signature, 1 otherwise.  Uses uefisign(8) -V, available in FreeBSD base
+# since 10.x.  Returns 1 (not signed) if the file is absent, empty, or if
+# uefisign returns a non-zero exit code for any reason — including when it is
+# not in PATH.  This fail-open default preserves normal copy behaviour on
+# systems that do not use Secure Boot signing.
+efi_is_signed() {
+    local file="$1"
+    [ -f "$file" ] || return 1
+    [ -s "$file" ] || return 1
+    uefisign -V "$file" >/dev/null 2>&1
+}
+
 # ============================================================
 # SPACE CHECK
 # ============================================================
@@ -976,6 +1006,17 @@ efi_safe_copy() {
     # Avoids unnecessary FAT32 writes on repeated freebsd-update install runs.
     if [ -f "$dst" ] && cmp -s "$src" "$dst" 2>/dev/null; then
         _efi_verb "Already up to date: ${dst}"
+        return 0
+    fi
+
+    # Refuse to overwrite a signed binary with an unsigned one.
+    # On a Secure Boot-enabled system, replacing a signed loader with an
+    # unsigned /boot/loader.efi would cause the firmware to reject it at
+    # next boot.  Leave the signed binary in place and warn; the operator
+    # must re-sign /boot/loader.efi with their enrolled key and copy manually.
+    if [ -f "$dst" ] && efi_is_signed "$dst"; then
+        _efi_warn "Skipping ${dst}: existing binary carries a Secure Boot signature"
+        _efi_warn "Re-sign /boot/loader.efi with your enrolled key and copy to the ESP manually"
         return 0
     fi
 
@@ -1265,19 +1306,28 @@ efi_update_esp() {
                 _efi_warn "Another OS may own this path; manual installation of loader_ia32.efi required"
             fi
         else
-            # No BOOTia32.efi present — install it.
-            local ia32_dst="${boot_dir}/BOOTia32.efi"
-            _efi_info "Installing ia32 fallback loader: ${ia32_dst}"
-            if [ "${EFI_DRY_RUN}" != "1" ]; then
-                mkdir -p "$boot_dir" 2>/dev/null || {
-                    _efi_err "Cannot create directory: ${boot_dir}"
-                    errors=$((errors + 1))
-                }
-            fi
-            if [ "$errors" -eq 0 ]; then
-                efi_safe_copy "${_EFI_LOADER_IA32_SRC}" "$ia32_dst" || \
-                    errors=$((errors + 1))
-                [ "${_efi_copy_wrote:-0}" = "1" ] && updated=$((updated + 1))
+            # No BOOTia32.efi present.  Only install fresh when EFI_INSTALL_IA32=1.
+            # On a bsdinstall-provisioned 32-bit UEFI system BOOTia32.efi is
+            # already on the ESP and is handled by the update path above.
+            # Installing without an explicit opt-in would add an unnecessary file
+            # to 64-bit UEFI ESPs where the ia32 source binary ships but is not
+            # needed by the firmware.
+            if [ "${EFI_INSTALL_IA32:-0}" = "1" ]; then
+                local ia32_dst="${boot_dir}/BOOTia32.efi"
+                _efi_info "Installing ia32 fallback loader: ${ia32_dst}"
+                if [ "${EFI_DRY_RUN}" != "1" ]; then
+                    mkdir -p "$boot_dir" 2>/dev/null || {
+                        _efi_err "Cannot create directory: ${boot_dir}"
+                        errors=$((errors + 1))
+                    }
+                fi
+                if [ "$errors" -eq 0 ]; then
+                    efi_safe_copy "${_EFI_LOADER_IA32_SRC}" "$ia32_dst" || \
+                        errors=$((errors + 1))
+                    [ "${_efi_copy_wrote:-0}" = "1" ] && updated=$((updated + 1))
+                fi
+            else
+                _efi_verb "ia32 source present but no BOOTia32.efi on ESP; set EFI_INSTALL_IA32=1 to install"
             fi
         fi
     fi

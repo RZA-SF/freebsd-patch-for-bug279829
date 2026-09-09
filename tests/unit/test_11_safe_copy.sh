@@ -24,7 +24,7 @@ export EFI_LOADER_SRC
 
 _tmpdir="$(mktemp -d)"
 
-tap_begin 10
+tap_begin 14
 
 # Test 1: normal copy -> dst matches src content
 _src="${_tmpdir}/src.efi"
@@ -112,6 +112,44 @@ printf 'version B\n' > "${_dst10}"
 EFI_DRY_RUN=0
 efi_safe_copy "${_src10}" "${_dst10}" 2>/dev/null
 assert_eq "different src/dst -> _efi_copy_wrote=1" "${_efi_copy_wrote}" "1"
+
+# Test 11: signed dst -> returns 0 (skip without error)
+# Simulate a signed destination by mocking uefisign -V to succeed (exit 0).
+_src11="${_tmpdir}/src11.efi"
+_dst11="${_tmpdir}/dst11.efi"
+printf 'new loader content\n' > "${_src11}"
+printf 'signed loader content\n' > "${_dst11}"
+mock_cmd_output uefisign "" 0
+EFI_DRY_RUN=0
+_rc=0
+efi_safe_copy "${_src11}" "${_dst11}" 2>/dev/null || _rc=$?
+assert_eq "signed dst -> returns 0 (no error)" "${_rc}" "0"
+
+# Test 12: signed dst -> _efi_copy_wrote is 0 (no write)
+assert_eq "signed dst -> _efi_copy_wrote=0" "${_efi_copy_wrote}" "0"
+
+# Test 13: signed dst -> dst content is unchanged (original binary preserved)
+_actual11="$(cat "${_dst11}")"
+assert_eq "signed dst -> dst content unchanged" "${_actual11}" "signed loader content"
+
+# Restore: remove the uefisign mock so subsequent tests use real (fail-open) behaviour.
+rm -f "${MOCK_BIN}/uefisign"
+hash -r 2>/dev/null || true
+
+# Test 14: no existing dst (new file install) -> uefisign not called, copy proceeds
+# efi_is_signed returns 1 immediately when the file is absent, so the signed
+# guard is bypassed entirely.  Probe: mock uefisign to fail so any call would
+# cause the file to appear signed and the copy to be skipped.
+_src14="${_tmpdir}/src14.efi"
+_dst14="${_tmpdir}/dst14.efi"
+printf 'fresh install content\n' > "${_src14}"
+mock_cmd_output uefisign "" 0   # would block copy if called on a non-existent dst
+EFI_DRY_RUN=0
+efi_safe_copy "${_src14}" "${_dst14}" 2>/dev/null
+assert_eq "new file install -> copy proceeds despite uefisign mock (_efi_copy_wrote=1)" \
+    "${_efi_copy_wrote}" "1"
+rm -f "${MOCK_BIN}/uefisign"
+hash -r 2>/dev/null || true
 
 tap_end
 

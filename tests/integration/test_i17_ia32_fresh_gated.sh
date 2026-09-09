@@ -1,22 +1,27 @@
 #!/bin/sh
-# test_i14_ia32_install_fresh.sh
+# test_i17_ia32_fresh_gated.sh
 #
-# Integration test: ia32 source present, no existing BOOTia32.efi on ESP.
+# Integration test: ia32 source present, no existing BOOTia32.efi on ESP,
+# EFI_INSTALL_IA32 not set (default 0).
 #
-# ESP contains BOOTx64.efi (FreeBSD) and EFI/FreeBSD/loader.efi.
-# No BOOTia32.efi present.  After update:
-#   - BOOTia32.efi created with ia32 loader content
-#   - BOOTx64.efi updated (normal)
-#   - EFI/FreeBSD/loader.efi updated (normal)
+# The ia32 fresh-install path is gated on EFI_INSTALL_IA32=1.  On a
+# bsdinstall-provisioned 32-bit UEFI system, BOOTia32.efi is already on the
+# ESP and reaches the update path instead.  Without the flag, installing fresh
+# would add an unnecessary file to 64-bit UEFI ESPs where the ia32 source
+# binary ships but the firmware does not require it.
 #
-# 5 assertions
+# Scenario: ESP has BOOTx64.efi and EFI/FreeBSD/loader.efi (standard 64-bit
+# layout); _EFI_LOADER_IA32_SRC exists; EFI_INSTALL_IA32 is 0 (default).
+# Expected: BOOTx64.efi and loader.efi are updated; BOOTia32.efi is NOT created.
+#
+# 4 assertions
 
 TESTS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "${TESTS_DIR}/lib/test_helpers.sh"
 . "${TESTS_DIR}/lib/mock_framework.sh"
 SRC_DIR="$(cd "${TESTS_DIR}/../src" && pwd)"
 
-tap_begin 5
+tap_begin 4
 
 setup_test_dir
 mock_init
@@ -26,7 +31,7 @@ FAKE_LOADER="${TEST_DIR}/loader.efi"
 printf 'FreeBSD/amd64 EFI loader, Revision 3.0 boot/lua UPDATED-v2' > "${FAKE_LOADER}"
 export EFI_LOADER_SRC="${FAKE_LOADER}"
 
-# --- Fake ia32 loader source ---
+# --- Fake ia32 loader source (present, as on amd64 14.3+/15.x) ---
 FAKE_IA32="${TEST_DIR}/loader_ia32.efi"
 printf 'FreeBSD/amd64-ia32 EFI loader, Revision 3.0 boot/lua ia32-UPDATED-v2' > "${FAKE_IA32}"
 export _EFI_LOADER_IA32_SRC="${FAKE_IA32}"
@@ -98,31 +103,26 @@ unset _EFI_BOOTLOADER_UPDATE_SH
 . "${SRC_DIR}/efi_bootloader_update.sh"
 _EFI_DEV_EFI=/dev/null
 export _EFI_DEV_EFI
-EFI_INSTALL_IA32=1
-export EFI_INSTALL_IA32
+# EFI_INSTALL_IA32 intentionally not set (defaults to 0)
+unset EFI_INSTALL_IA32
 
 update_bootloaders
 _rc=$?
 
 assert_eq "update_bootloaders returns 0" "${_rc}" "0"
 
-assert_file_exists \
-    "BOOTia32.efi created (fresh install)" \
-    "${FAKE_MP}/EFI/BOOT/BOOTia32.efi"
-
-_ia32=$(cat "${FAKE_MP}/EFI/BOOT/BOOTia32.efi" 2>/dev/null)
-assert_contains \
-    "BOOTia32.efi has ia32 loader content" \
-    "${_ia32}" "ia32-UPDATED-v2"
+assert_false \
+    "BOOTia32.efi NOT created (EFI_INSTALL_IA32 not set)" \
+    test -f "${FAKE_MP}/EFI/BOOT/BOOTia32.efi"
 
 _x64=$(cat "${FAKE_MP}/EFI/BOOT/BOOTx64.efi" 2>/dev/null)
 assert_contains \
-    "BOOTx64.efi also updated (normal operation)" \
+    "BOOTx64.efi updated (normal operation unaffected)" \
     "${_x64}" "UPDATED-v2"
 
 _fbsd=$(cat "${FAKE_MP}/EFI/FreeBSD/loader.efi" 2>/dev/null)
 assert_contains \
-    "EFI/FreeBSD/loader.efi also updated (normal operation)" \
+    "EFI/FreeBSD/loader.efi updated (normal operation unaffected)" \
     "${_fbsd}" "UPDATED-v2"
 
 mock_cleanup
