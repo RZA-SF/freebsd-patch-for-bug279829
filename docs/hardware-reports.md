@@ -11,7 +11,7 @@ notes and bug narratives follow in the [contributor sections](#contributor-detai
 ## Coverage Matrix
 
 Each row is one test environment. **Suite** = `./tests/run_tests.sh` pass
-count on that FreeBSD version at time of testing (current suite: 325 tests).
+count on that FreeBSD version at time of testing (current suite: 328 tests).
 **Run** = live or dry-run execution on real hardware/cloud. **Bugs** = fix
 revisions first surfaced by this environment (full narratives in the detail
 sections).
@@ -25,8 +25,8 @@ sections).
 | marklmi | Raspberry Pi 3B | arm64 | 14.5-BETA2 | UFS | MBR | EFI (U-Boot) | — | ✓ live | R-11 |
 | marklmi | Honeycomb LX2160A | arm64 | main | UFS | GPT | EFI | — | ✓ live | R-08 |
 | Stefan | amd64 workstation (3-disk, diskid/ vdevs) | amd64 | CURRENT | ZFS | GPT | EFI | — | ✓ live | R-15, R-16 |
-| RZA-SF | Physical workstation | amd64 | 14.0-RELEASE-p11 | ZFS | GPT | EFI+BIOS | 325/325 | suite + dry-run (live hardware) | R-01, R-02 |
-| RZA-SF | Physical workstation | amd64 | 15.1-RELEASE-p3 | ZFS | GPT | EFI+BIOS | 325/325 | suite + dry-run (live hardware) | — |
+| RZA-SF | Physical workstation | amd64 | 14.0-RELEASE-p11 | ZFS | GPT | EFI+BIOS | 328/328 | suite + dry-run (live hardware) | R-01, R-02 |
+| RZA-SF | Physical workstation | amd64 | 15.1-RELEASE-p3 | ZFS | GPT | EFI+BIOS | 328/328 | suite + dry-run (live hardware) | — |
 | RZA-SF | AWS Graviton EC2 | aarch64 | 13.5-RELEASE | UFS | GPT | EFI | 291/291 | dry-run | R-17 |
 | RZA-SF | AWS Graviton EC2 | aarch64 | 14.4-RELEASE-p9 | UFS | GPT | EFI | 291/291 | dry-run | — |
 | RZA-SF | AWS Graviton EC2 | aarch64 | 14.4-RELEASE-p9 | ZFS | GPT | EFI | 291/291 | dry-run | — |
@@ -544,6 +544,13 @@ Firmware ignores UEFI `BootOrder` variable entirely and does not respond to `bcd
 | 2026-09-09 | Physical workstation | amd64 | 14.0-RELEASE-p11 | ✓ 325/325 | +2 EFI_NVRAM_UPDATE=0 tests confirmed (test_13 cases 13-14); 48 files, 0 failed, 0 skipped |
 | 2026-09-09 | Physical workstation | amd64 | 15.1-RELEASE-p3 | ✓ 325/325 | +2 EFI_NVRAM_UPDATE=0 tests confirmed (test_13 cases 13-14); 48 files, 0 failed, 0 skipped |
 
+### Test suite runs — revision-6 (uefisign absent fail-safe)
+
+| Date | Platform | Arch | FreeBSD | Result | Notes |
+|------|----------|------|---------|--------|-------|
+| 2026-09-10 | Physical workstation | amd64 | 14.0-RELEASE-p11 | ✓ 328/328 | +3 uefisign-absent fail-safe tests (test_11 cases 15-17) confirmed; 48 files, 0 failed, 0 skipped |
+| 2026-09-10 | Physical workstation | amd64 | 15.1-RELEASE-p3 | ✓ 328/328 | +3 uefisign-absent fail-safe tests (test_11 cases 15-17) confirmed; 48 files, 0 failed, 0 skipped |
+
 ### Dry-run — revision-5 (14.0-RELEASE-p11)
 
 | Date | Platform | Arch | FreeBSD | Root FS | Boot | Outcome |
@@ -572,6 +579,49 @@ Firmware ignores UEFI `BootOrder` variable entirely and does not respond to `bcd
 - **NVRAM Guard 1:** `fallback_is_freebsd=1` (bootx64.efi fingerprint match) → skip NVRAM entry creation. BootCurrent: Boot0002 (FreeBSD, PARTUUID `f28b98a1-...`).
 - **Lowercase ESP directory:** `find -iname FreeBSD` finds `/boot/efi/efi/freebsd` (lowercase `freebsd`). Case-insensitive find handles FAT32's case-folding behavior correctly.
 - **BIOS path:** would update nda0p2 (gptzfsboot, ZFS root).
+
+### Dry-run — revision-6 (14.0-RELEASE-p11)
+
+| Date | Platform | Arch | FreeBSD | Root FS | Boot | Outcome |
+|------|----------|------|---------|---------|------|---------|
+| 2026-09-10 | Physical workstation | amd64 | 14.0-RELEASE-p11 | ZFS (zroot/nda0p4) | EFI+BIOS | ✓ All paths correct. Identical behavior to revision-5 dry-run. uefisign not called in dry-run path (efi_safe_copy returns before signed check when EFI_DRY_RUN=1). |
+
+**Key observations:**
+
+- **gpart --libxo fallback:** `gpart show -p --libxo json nda0` → rc=1; text-mode fallback used for both ESP and BIOS discovery. Unchanged from revision-5.
+- **ESP pre-mounted by device path:** `/dev/nda0p1` → `/boot/efi` direct match in mount table; glabel path not needed.
+- **Space check:** 208,130,048 B available, 1,385,472 B needed → OK. (`_efi_esp_is_real=1` — real check runs because ESP is pre-mounted.)
+- **FreeBSD dir found:** `/boot/efi/efi/FreeBSD/loader.efi` via case-insensitive find.
+- **Would update:** `/boot/efi/efi/FreeBSD/loader.efi` and `/boot/efi/EFI/boot/BOOTx64.efi`.
+- **Fingerprint:** `BOOTx64.efi` → `bootprog_info` pattern match → `fallback_is_freebsd=1`.
+- **uefisign guard:** Not reached in dry-run — `efi_safe_copy` exits early at `EFI_DRY_RUN=1` before the signed-destination check. Correct behavior.
+- **ia32:** `/boot/loader_ia32.efi` absent on 14.0 → ia32 block skipped silently.
+- **NVRAM Guard 1:** `fallback_is_freebsd=1` → skip NVRAM entry creation.
+- **BIOS:** Would run `gpart bootcode -b /boot/pmbr -p /boot/gptzfsboot -i 2 nda0`.
+
+---
+
+### Dry-run — revision-6 (15.1-RELEASE-p3)
+
+| Date | Platform | Arch | FreeBSD | Root FS | Boot | Outcome |
+|------|----------|------|---------|---------|------|---------|
+| 2026-09-10 | Physical workstation | amd64 | 15.1-RELEASE-p3 | ZFS (zroot/nda0p4) | EFI+BIOS | ✓ All paths correct. Identical behavior to revision-5 dry-run. uefisign not called in dry-run path. |
+
+**Key observations:**
+
+- **gpart --libxo json succeeds on 15.x:** rc=0; JSON path taken for both ESP and BIOS discovery. No text fallback. Contrast with 14.0 where rc=1 forces text fallback.
+- **ESP via gpt/efiboot0 glabel:** `/dev/nda0p1` not in mount table by device path. Glabel loop: `gpt/efiboot0` → component `nda0p1` → `/boot/efi` ✓. (`_efi_esp_is_real=1`; real space check runs.)
+- **Space check:** 267,086,848 B available, 1,396,736 B needed → OK. (260 MB ESP; 15.x loader is 665,600 B.)
+- **FreeBSD dir found:** `/boot/efi/efi/freebsd` (lowercase; FAT32 case-folding, case-insensitive find handles it).
+- **Would update:** `/boot/efi/efi/freebsd/loader.efi` and `/boot/efi/EFI/boot/bootx64.efi`.
+- **Fingerprint:** `bootx64.efi` → `bootprog_info` match → `fallback_is_freebsd=1`.
+- **uefisign guard:** Not reached in dry-run — `efi_safe_copy` exits early at `EFI_DRY_RUN=1` before the signed-destination check. Correct behavior.
+- **ia32 gate fires correctly:** `/boot/loader_ia32.efi` present (14.3+). No existing `BOOTia32.efi` on ESP. `EFI_INSTALL_IA32` not set → verbose gate: "ia32 source present but no BOOTia32.efi on ESP; set EFI_INSTALL_IA32=1 to install". No file created.
+- **NVRAM Guard 1:** `fallback_is_freebsd=1` (`bootx64.efi` fingerprint match) → skip NVRAM entry creation.
+- **BootCurrent:** Boot0002 (`gpt/efiboot0:/EFI/boot/bootx64.efi`, PARTUUID `f28b98a1-...`). PARTUUID matches `nda0p1` on this machine.
+- **BIOS:** Would run `gpart bootcode -b /boot/pmbr -p /boot/gptzfsboot -i 2 nda0`.
+
+---
 
 ### AWS Graviton EC2 — FreeBSD 13.5 aarch64 (R-17)
 
@@ -1016,6 +1066,9 @@ Chronological record of all test suite runs across the development of this patch
 | 2026-09-07 | amd64 | 14.0-RELEASE-p11 | Physical workstation (patient zero) | ZFS | EFI+BIOS | dry-run | revision-4: gpart --libxo json unavailable on 14.0 → text fallback used for both ESP + BIOS discovery; direct /dev/nda0p1 mount match (no GEOM label needed); loader_ia32.efi absent → ia32 skipped; Guard 1 fires (BOOTx64.efi is FreeBSD) → NVRAM skipped; BIOS nda0p2 → gptzfsboot |
 | 2026-09-09 | amd64 | 15.1-RELEASE-p3 | Physical workstation (felix) | ZFS | EFI+BIOS | ✓ 325/325 | revision-5: Secure Boot signature guard + EFI_INSTALL_IA32 gate + UpdateBootloaderNVRAM conf option; all 48 test files pass; EFI_INSTALL_IA32 gate (test_i17) + EFI_NVRAM_UPDATE=0 (test_13 cases 13-14) confirmed |
 | 2026-09-09 | amd64 | 14.0-RELEASE-p11 | Physical workstation (patient zero) | ZFS | EFI+BIOS | ✓ 325/325 | revision-5: all 48 test files pass; loader_ia32.efi absent on 14.0 — ia32 skip path confirmed; EFI_NVRAM_UPDATE=0 tests (test_13 cases 13-14) confirmed |
+| 2026-09-10 | amd64 | 14.0-RELEASE-p11 | Physical workstation (patient zero) | ZFS | EFI+BIOS | ✓ 328/328 | revision-6: uefisign-absent fail-safe (test_11 cases 15-17) confirmed; 48 files, 0 failed, 0 skipped; dry-run clean (same behavior as revision-5) |
+| 2026-09-10 | amd64 | 15.1-RELEASE-p3 | Physical workstation (felix) | ZFS | EFI+BIOS | ✓ 328/328 | revision-6: uefisign-absent fail-safe (test_11 cases 15-17) confirmed; 48 files, 0 failed, 0 skipped |
+| 2026-09-10 | amd64 | 15.1-RELEASE-p3 | Physical workstation (felix) | ZFS | EFI+BIOS | dry-run | revision-6: gpart --libxo json (15.x); gpt/efiboot0 glabel; ia32 gate fires; Guard 1 fires (fallback_is_freebsd=1); BIOS gptzfsboot nda0p2; uefisign not called in dry-run path |
 
 ---
 

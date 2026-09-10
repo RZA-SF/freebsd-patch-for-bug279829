@@ -930,16 +930,18 @@ efi_is_freebsd_loader() {
 }
 
 # Returns 0 if the given EFI binary carries an Authenticode / Secure Boot
-# signature, 1 otherwise.  Uses uefisign(8) -V, available in FreeBSD base
-# since 10.x.  Returns 1 (not signed) if the file is absent, empty, or if
-# uefisign returns a non-zero exit code for any reason — including when it is
-# not in PATH.  This fail-open default preserves normal copy behaviour on
-# systems that do not use Secure Boot signing.
+# signature, 1 if confirmed unsigned (uefisign ran and found no signature),
+# or 2 if the check cannot be performed because uefisign(8) is not in PATH
+# (detected via shell exit code 127 — command not found).  File absent or
+# empty returns 1.  Callers must not proceed with a copy when 2 is returned.
 efi_is_signed() {
-    local file="$1"
+    local file="$1" _rc
     [ -f "$file" ] || return 1
     [ -s "$file" ] || return 1
     uefisign -V "$file" >/dev/null 2>&1
+    _rc=$?
+    [ "$_rc" = "127" ] && return 2
+    return "$_rc"
 }
 
 # ============================================================
@@ -1009,15 +1011,25 @@ efi_safe_copy() {
         return 0
     fi
 
-    # Refuse to overwrite a signed binary with an unsigned one.
-    # On a Secure Boot-enabled system, replacing a signed loader with an
-    # unsigned /boot/loader.efi would cause the firmware to reject it at
-    # next boot.  Leave the signed binary in place and warn; the operator
-    # must re-sign /boot/loader.efi with their enrolled key and copy manually.
-    if [ -f "$dst" ] && efi_is_signed "$dst"; then
-        _efi_warn "Skipping ${dst}: existing binary carries a Secure Boot signature"
-        _efi_warn "Re-sign /boot/loader.efi with your enrolled key and copy to the ESP manually"
-        return 0
+    # Refuse to overwrite the destination when it is signed or when we cannot
+    # confirm that it is unsigned.  Replacing a signed loader with an unsigned
+    # one on a Secure Boot-enabled system causes the firmware to reject it at
+    # next boot.  If uefisign(8) is absent we cannot confirm the file is
+    # unsigned, so we skip the copy to be safe.
+    if [ -f "$dst" ]; then
+        local _efi_signed
+        efi_is_signed "$dst"
+        _efi_signed=$?
+        if [ "$_efi_signed" = "0" ]; then
+            _efi_warn "Skipping ${dst}: existing binary carries a Secure Boot signature"
+            _efi_warn "Re-sign /boot/loader.efi with your enrolled key and copy to the ESP manually"
+            return 0
+        elif [ "$_efi_signed" = "2" ]; then
+            _efi_warn "uefisign(8) not found — cannot verify whether ${dst} carries a"
+            _efi_warn "Secure Boot signature; skipping to avoid overwriting a potentially"
+            _efi_warn "signed binary"
+            return 0
+        fi
     fi
 
     cp -f "$src" "$tmp" 2>/dev/null || {
