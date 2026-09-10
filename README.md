@@ -2,7 +2,7 @@
 
 This repository contains a patch for `freebsd-update` that automatically updates the EFI bootloader on the ESP (EFI System Partition) during `freebsd-update install`. Without this fix, upgrading FreeBSD across major versions can silently leave a stale bootloader on the ESP — one that cannot boot the newly installed system.
 
-The patch is developed here ahead of submission to the FreeBSD project via Phabricator. It has been tested on real FreeBSD hardware across multiple versions with a 325-test suite covering unit, integration, and error conditions across a broad range of configurations.
+The patch is developed here ahead of submission to the FreeBSD project via Phabricator. It has been tested on real FreeBSD hardware across multiple versions with a 328-test suite covering unit, integration, and error conditions across a broad range of configurations.
 
 **Addresses:** [FreeBSD bug 279829](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=279829)
 **Upstream status:** Closed "Not a bug" — but the underlying hazard is real and ongoing
@@ -13,14 +13,14 @@ The patch is developed here ahead of submission to the FreeBSD project via Phabr
 
 | | |
 |---|---|
-| Test suite | 325 / 325 passing |
+| Test suite | 328 / 328 passing |
 | Live run | ✓ Complete — FreeBSD 14.0-RELEASE-p11, amd64, UEFI, ZFS, NVMe |
-| Phabricator submission | ✓ [D58990](https://reviews.freebsd.org/D58990) — revision-5 uploaded (D58990?id=186318) |
+| Phabricator submission | ✓ [D58990](https://reviews.freebsd.org/D58990) — revision-6 uploaded (D58990?id=186344) |
 | Backport targets | `main` (15-CURRENT), `stable/14`, `stable/13` |
 
 ### Test Suite Run History
 
-325/325 tests passing. Validated across:
+328/328 tests passing. Validated across:
 - **Architectures:** amd64, aarch64
 - **FreeBSD versions:** 13.5, 14.0, 14.3, 14.4, 15.1 (RELEASE and CURRENT)
 - **Root filesystems:** ZFS, UFS

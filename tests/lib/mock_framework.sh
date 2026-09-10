@@ -21,6 +21,10 @@ mock_init() {
     unset EFI_DRY_RUN EFI_VERBOSE EFI_NVRAM_UPDATE
     # Clear FreeBSD sh command hash table so new mocks are found immediately
     hash -r 2>/dev/null || true
+    # Default uefisign mock: confirmed not signed (exit 1).  efi_is_signed
+    # treats exit 0 as signed and exit 127 as absent/indeterminate.
+    # Tests that need signed (exit 0) or absent (exit 127) override this.
+    mock_cmd_output uefisign "" 1
 }
 
 # mock_cleanup: Removes mock bin dir and call log

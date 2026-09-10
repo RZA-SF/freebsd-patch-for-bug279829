@@ -311,7 +311,7 @@ assert_eq "UFS diskid: realpath unchanged, partition suffix stripped → diskid/
 # (nda0) returns empty — R-16 must not call it.  Returns "diskid/DISK-abc123".
 mock_cmd realpath 'echo "/dev/diskid/DISK-abc123p2"'
 mock_cmd gpart 'case "$*" in
-    *"list nda0"*) : ;;   # empty — simulates FreeBSD-CURRENT behaviour
+    *"list nda0"*) : ;;   # empty — simulates FreeBSD-CURRENT behavior
 esac'
 mock_cmd sysctl 'case "$*" in *kern.disks*) echo "nda0" ;; *) echo "0" ;; esac'
 mock_cmd mount 'printf "{\"mount\":{\"mounted\":[{\"special\":\"zroot/ROOT/default\",\"node\":\"/\",\"fstype\":\"zfs\",\"opts\":[\"rw\"]}]}}\n"'

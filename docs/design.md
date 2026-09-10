@@ -1061,7 +1061,9 @@ manage the ESP themselves.
 on the source `/boot/loader.efi`.  It trusts that `freebsd-update` delivered
 it from the signed base distribution.
 
-**Fail-open:** If `uefisign(8)` returns a non-zero exit code for any reason
-— including when it is not in PATH — `efi_is_signed` returns 1 (not signed)
-and the copy proceeds.  This preserves normal behaviour on systems that do
-not use Secure Boot signing.
+**Fail-safe:** If `uefisign(8)` is not in PATH (detected via exit code 127),
+`efi_is_signed` returns 2 (indeterminate) and `efi_safe_copy` skips the copy
+with a warning.  We cannot assert the binary is unsigned if we cannot run the
+check.  On a standard FreeBSD installation `uefisign` is always present in
+`/usr/bin`; the indeterminate path is a safety net for non-standard
+environments.

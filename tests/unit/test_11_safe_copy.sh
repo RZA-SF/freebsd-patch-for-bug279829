@@ -1,7 +1,7 @@
 #!/bin/sh
 # test_11_safe_copy.sh - Tests for efi_safe_copy
 #
-# Verifies the atomic copy-via-temp-rename behaviour, error handling, and
+# Verifies the atomic copy-via-temp-rename behavior, error handling, and
 # dry-run mode.  Uses real temp directories and files — no mocking needed
 # for the happy path.
 
@@ -14,6 +14,9 @@ mock_init
 
 mock_cmd_output id "0"
 mock_cmd_output sysctl "0"
+# Default: uefisign confirms not signed (exit 1).  Overridden per-test for
+# signed (exit 0) and absent (exit 127) cases.
+mock_cmd_output uefisign "" 1
 
 _dummy_loader="$(mktemp)"
 printf 'dummy' > "${_dummy_loader}"
@@ -24,7 +27,7 @@ export EFI_LOADER_SRC
 
 _tmpdir="$(mktemp -d)"
 
-tap_begin 14
+tap_begin 17
 
 # Test 1: normal copy -> dst matches src content
 _src="${_tmpdir}/src.efi"
@@ -132,14 +135,13 @@ assert_eq "signed dst -> _efi_copy_wrote=0" "${_efi_copy_wrote}" "0"
 _actual11="$(cat "${_dst11}")"
 assert_eq "signed dst -> dst content unchanged" "${_actual11}" "signed loader content"
 
-# Restore: remove the uefisign mock so subsequent tests use real (fail-open) behaviour.
-rm -f "${MOCK_BIN}/uefisign"
-hash -r 2>/dev/null || true
+# Restore uefisign to default (not signed).
+mock_cmd_output uefisign "" 1
 
 # Test 14: no existing dst (new file install) -> uefisign not called, copy proceeds
 # efi_is_signed returns 1 immediately when the file is absent, so the signed
-# guard is bypassed entirely.  Probe: mock uefisign to fail so any call would
-# cause the file to appear signed and the copy to be skipped.
+# guard is bypassed entirely.  Probe: mock uefisign to exit 0 (signed) so any
+# call on the destination would block the copy.
 _src14="${_tmpdir}/src14.efi"
 _dst14="${_tmpdir}/dst14.efi"
 printf 'fresh install content\n' > "${_src14}"
@@ -148,8 +150,26 @@ EFI_DRY_RUN=0
 efi_safe_copy "${_src14}" "${_dst14}" 2>/dev/null
 assert_eq "new file install -> copy proceeds despite uefisign mock (_efi_copy_wrote=1)" \
     "${_efi_copy_wrote}" "1"
-rm -f "${MOCK_BIN}/uefisign"
-hash -r 2>/dev/null || true
+
+# Switch uefisign mock to simulate absent (exit 127 = shell "command not found").
+mock_cmd_output uefisign "" 127
+
+# Test 15: uefisign absent (exit 127) + existing dst -> returns 0 (fail-safe: skip)
+_src15="${_tmpdir}/src15.efi"
+_dst15="${_tmpdir}/dst15.efi"
+printf 'new content\n' > "${_src15}"
+printf 'existing content\n' > "${_dst15}"
+EFI_DRY_RUN=0
+_rc=0
+efi_safe_copy "${_src15}" "${_dst15}" 2>/dev/null || _rc=$?
+assert_eq "uefisign absent -> returns 0 (skip, fail-safe)" "${_rc}" "0"
+
+# Test 16: uefisign absent + existing dst -> _efi_copy_wrote=0 (no write)
+assert_eq "uefisign absent -> _efi_copy_wrote=0" "${_efi_copy_wrote}" "0"
+
+# Test 17: uefisign absent + existing dst -> dst content unchanged
+_actual15="$(cat "${_dst15}")"
+assert_eq "uefisign absent -> dst content unchanged" "${_actual15}" "existing content"
 
 tap_end
 
