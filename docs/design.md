@@ -1061,9 +1061,20 @@ manage the ESP themselves.
 on the source `/boot/loader.efi`.  It trusts that `freebsd-update` delivered
 it from the signed base distribution.
 
-**Fail-safe:** If `uefisign(8)` is not in PATH (detected via exit code 127),
-`efi_is_signed` returns 2 (indeterminate) and `efi_safe_copy` skips the copy
-with a warning.  We cannot assert the binary is unsigned if we cannot run the
-check.  On a standard FreeBSD installation `uefisign` is always present in
-`/usr/bin`; the indeterminate path is a safety net for non-standard
-environments.
+**Fail-safe:** `efi_is_signed` returns 2 (indeterminate) in two situations,
+both of which cause `efi_safe_copy` to skip the copy with a warning:
+
+1. `uefisign(8)` is not in PATH (exit 127).  On a standard FreeBSD
+   installation `uefisign` is always present in `/usr/bin`; exit 127 indicates
+   a non-standard environment.
+
+2. `uefisign` ran but returned non-zero with output that does not contain
+   `"file not signed"` (e.g. `"MZ header not found"`, permission errors, PE
+   parse errors).  The confirmed-unsigned path is identified by parsing stderr:
+   `"file not signed"` is a hardcoded literal in `child.c:248` distinct from
+   every error path, confirmed from source and tested on 14.0 and 15.1.  This
+   disambiguates the ambiguous exit code 1 that uefisign currently uses for
+   both "not signed" and all error conditions (PR 298383 / D59580).  If the
+   output string ever changes, `efi_is_signed` emits a diagnostic warning and
+   treats the result as indeterminate; the copy is skipped rather than
+   proceeding on an unverified assumption.
