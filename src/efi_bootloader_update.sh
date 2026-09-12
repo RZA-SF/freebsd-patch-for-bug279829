@@ -930,18 +930,33 @@ efi_is_freebsd_loader() {
 }
 
 # Returns 0 if the given EFI binary carries an Authenticode / Secure Boot
-# signature, 1 if confirmed unsigned (uefisign ran and found no signature),
-# or 2 if the check cannot be performed because uefisign(8) is not in PATH
-# (detected via shell exit code 127 — command not found).  File absent or
-# empty returns 1.  Callers must not proceed with a copy when 2 is returned.
+# signature, 1 if confirmed unsigned (uefisign ran and reported "file not
+# signed"), or 2 if the check is indeterminate — uefisign(8) is absent (exit
+# 127) or returned non-zero with unexpected output (e.g. "MZ header not found",
+# permission error, PE parse error).  File absent or empty returns 1.  Callers
+# must not proceed with a copy when 2 is returned.
+#
+# uefisign currently uses exit 1 for both "not signed" and all error conditions
+# (see child.c:248, pe.c).  We disambiguate by parsing stderr: "file not
+# signed" is a hardcoded literal in child.c:248 and is distinct from every
+# error path (confirmed from source and tested on 14.0 and 15.1).  When
+# D59580 lands, this output check can be replaced with a clean exit code.
 efi_is_signed() {
-    local file="$1" _rc
+    local file="$1" _rc _out
     [ -f "$file" ] || return 1
     [ -s "$file" ] || return 1
-    uefisign -V "$file" >/dev/null 2>&1
+    _out=$(uefisign -V "$file" 2>&1)
     _rc=$?
+    [ "$_rc" = "0" ] && return 0
     [ "$_rc" = "127" ] && return 2
-    return "$_rc"
+    case "$_out" in
+        *"file not signed"*) return 1 ;;
+        *)
+            _efi_warn "efi_is_signed: unexpected uefisign output: ${_out}"
+            _efi_warn "Cannot confirm ${file} is unsigned; treating as indeterminate"
+            return 2
+            ;;
+    esac
 }
 
 # ============================================================
@@ -1124,6 +1139,11 @@ efi_ensure_nvram_entry() {
         return 0
     fi
 
+    # Record the current default (first BootOrder entry) so we can verify it
+    # is preserved after creating the FreeBSD entry and correcting BootOrder.
+    local _original_default
+    _original_default=$(printf '%s\n' "$_boot_order" | awk '{print $1}')
+
     # If the fallback belongs to FreeBSD, find its ordinal position in
     # BootOrder so the new entry lands in the same slot (preserving the
     # user's boot priority).  Otherwise the new entry is appended.
@@ -1176,7 +1196,13 @@ efi_ensure_nvram_entry() {
         [ "$_found" = "0" ] && echo "$_n" && break
     done)
 
-    [ -n "$_new_num" ] || return 0
+    if [ -z "$_new_num" ]; then
+        _efi_warn "Could not identify new NVRAM entry — BootOrder not adjusted"
+        _efi_warn "FreeBSD may now be the default boot entry"
+        [ -n "$_original_default" ] && \
+            _efi_warn "To restore: efibootmgr -o $(printf '%s\n' "$_boot_order" | tr ' ' ',')"
+        return 0
+    fi
 
     # Build the corrected BootOrder.
     local _rebuilt="" _pos=0 _bnum _inserted=0
@@ -1191,8 +1217,26 @@ efi_ensure_nvram_entry() {
     done
     [ "$_inserted" = "0" ] && _rebuilt="${_rebuilt:+${_rebuilt},}${_new_num}"
 
-    efibootmgr -o "$_rebuilt" >/dev/null 2>&1 || \
+    if efibootmgr -o "$_rebuilt" >/dev/null 2>&1; then
+        # Verify the original default is still first — some firmware ignores
+        # BootOrder writes (e.g. ASUS boards with aggressive auto-recovery).
+        local _post_first
+        _post_first=$(efibootmgr 2>/dev/null | awk '/^BootOrder[[:space:]]*:/{
+            sub(/^BootOrder[[:space:]]*:[[:space:]]*/,"")
+            gsub(/,[[:space:]]*/," ")
+            print $1; exit}')
+        if [ -n "$_original_default" ] && [ -n "$_post_first" ] && \
+           [ "$_post_first" != "$_original_default" ]; then
+            _efi_warn "BootOrder not preserved — default boot entry is now Boot${_post_first}"
+            _efi_warn "Previous default was Boot${_original_default}"
+            _efi_warn "To restore: efibootmgr -o $(printf '%s\n' "$_boot_order" | tr ' ' ',')"
+        fi
+    else
         _efi_warn "efibootmgr: could not set BootOrder — entry created but order not adjusted"
+        _efi_warn "FreeBSD may now be the default boot entry"
+        [ -n "$_original_default" ] && \
+            _efi_warn "To restore: efibootmgr -o $(printf '%s\n' "$_boot_order" | tr ' ' ',')"
+    fi
 }
 
 # Update all FreeBSD EFI loaders on a mounted ESP, and create the

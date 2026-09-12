@@ -14,9 +14,10 @@ mock_init
 
 mock_cmd_output id "0"
 mock_cmd_output sysctl "0"
-# Default: uefisign confirms not signed (exit 1).  Overridden per-test for
-# signed (exit 0) and absent (exit 127) cases.
-mock_cmd_output uefisign "" 1
+# Default: uefisign confirms not signed (exit 1 + "file not signed" output).
+# efi_is_signed parses output to distinguish "not signed" from error conditions.
+# Overridden per-test for signed (exit 0) and absent (exit 127) cases.
+mock_cmd_output uefisign "uefisign: file not signed" 1
 
 _dummy_loader="$(mktemp)"
 printf 'dummy' > "${_dummy_loader}"
@@ -27,7 +28,7 @@ export EFI_LOADER_SRC
 
 _tmpdir="$(mktemp -d)"
 
-tap_begin 17
+tap_begin 21
 
 # Test 1: normal copy -> dst matches src content
 _src="${_tmpdir}/src.efi"
@@ -136,7 +137,7 @@ _actual11="$(cat "${_dst11}")"
 assert_eq "signed dst -> dst content unchanged" "${_actual11}" "signed loader content"
 
 # Restore uefisign to default (not signed).
-mock_cmd_output uefisign "" 1
+mock_cmd_output uefisign "uefisign: file not signed" 1
 
 # Test 14: no existing dst (new file install) -> uefisign not called, copy proceeds
 # efi_is_signed returns 1 immediately when the file is absent, so the signed
@@ -170,6 +171,40 @@ assert_eq "uefisign absent -> _efi_copy_wrote=0" "${_efi_copy_wrote}" "0"
 # Test 17: uefisign absent + existing dst -> dst content unchanged
 _actual15="$(cat "${_dst15}")"
 assert_eq "uefisign absent -> dst content unchanged" "${_actual15}" "existing content"
+
+# Switch uefisign mock to simulate an error condition: exits 1 but with output
+# that is NOT "file not signed" (e.g. "MZ header not found" from a non-PE file).
+# efi_is_signed treats this as indeterminate (return 2) — fail-safe.
+mock_cmd_output uefisign "uefisign: MZ header not found" 1
+
+# Test 18: uefisign error output (not "file not signed") + existing dst -> returns 0 (fail-safe: skip)
+_src18="${_tmpdir}/src18.efi"
+_dst18="${_tmpdir}/dst18.efi"
+printf 'new content\n' > "${_src18}"
+printf 'existing content\n' > "${_dst18}"
+EFI_DRY_RUN=0
+_rc=0
+efi_safe_copy "${_src18}" "${_dst18}" 2>/dev/null || _rc=$?
+assert_eq "uefisign error output -> returns 0 (skip, fail-safe)" "${_rc}" "0"
+
+# Test 19: uefisign error output + existing dst -> _efi_copy_wrote=0 (no write)
+assert_eq "uefisign error output -> _efi_copy_wrote=0" "${_efi_copy_wrote}" "0"
+
+# Test 20: uefisign error output + existing dst -> dst content unchanged
+_actual18="$(cat "${_dst18}")"
+assert_eq "uefisign error output -> dst content unchanged" "${_actual18}" "existing content"
+
+# Test 21: uefisign error output -> diagnostic warning emitted to stderr
+# Confirms that unexpected output is not silently swallowed; admins are
+# notified if the "file not signed" pattern no longer matches.
+_src21="${_tmpdir}/src21.efi"
+_dst21="${_tmpdir}/dst21.efi"
+printf 'new content\n' > "${_src21}"
+printf 'existing content\n' > "${_dst21}"
+EFI_DRY_RUN=0
+_warn21=$(efi_safe_copy "${_src21}" "${_dst21}" 2>&1)
+assert_contains "uefisign error output -> diagnostic warning emitted" \
+    "${_warn21}" "unexpected uefisign output"
 
 tap_end
 
