@@ -38,7 +38,7 @@ export EFI_LOADER_SRC
 _ESP_MOUNT="/tmp/esp_test"
 _LOADER_ABS="${_ESP_MOUNT}/EFI/FreeBSD/loader.efi"
 
-tap_begin 16
+tap_begin 17
 
 # Simulate EFIRT available for all tests except the EFIRT-absent test.
 _EFI_DEV_EFI=/dev/null
@@ -274,10 +274,13 @@ assert_contains \
     "_new_num not found -> diagnostic warning emitted" \
     "${_warn15}" "Could not identify new NVRAM entry"
 
-# Test 16: BootOrder not preserved after -o set -> diagnostic warning emitted.
-# Simulates firmware that accepts the efibootmgr -o call (exit 0) but does not
-# update BootOrder (e.g. ASUS boards with aggressive auto-recovery).  The
-# post-set verification read shows FreeBSD still first; the warning should fire.
+# Test 16: BootOrder not preserved after both -o attempts -> warning emitted.
+# Simulates firmware that accepts efibootmgr -o (exit 0) both times but never
+# applies the change (e.g. ASUS boards with aggressive auto-recovery).  Both
+# post-set verification reads show FreeBSD still first; warning fires after the
+# second failed attempt.
+# Mock sequence: call 1=query, 2=create, 3=post-create read, 4=-o set,
+# 5=verify1 (wrong), 6=retry -o, 7=verify2 (still wrong) -> warn.
 : > "${MOCK_CALL_LOG}"
 cat > "${MOCK_BIN}/efibootmgr" << MOCK_EOF
 #!/bin/sh
@@ -289,6 +292,8 @@ case "\${_n}" in
     3) printf 'BootOrder  : 0005, 0001, 0000\n' ; exit 0 ;;
     4) exit 0 ;;
     5) printf 'BootOrder  : 0005, 0001, 0000\n' ; exit 0 ;;
+    6) exit 0 ;;
+    7) printf 'BootOrder  : 0005, 0001, 0000\n' ; exit 0 ;;
     *) exit 0 ;;
 esac
 MOCK_EOF
@@ -298,8 +303,40 @@ EFI_DRY_RUN=0
 _warn16=$(efi_ensure_nvram_entry "${_ESP_MOUNT}" "${_LOADER_ABS}" \
     "BOOTx64.efi" "0" 2>&1)
 assert_contains \
-    "BootOrder not preserved after -o -> diagnostic warning emitted" \
-    "${_warn16}" "BootOrder not preserved"
+    "BootOrder not preserved after two attempts -> warning emitted" \
+    "${_warn16}" "BootOrder not preserved after two attempts"
+
+# Test 17: BootOrder correction succeeds on retry -> no warning emitted.
+# Simulates firmware that ignores the first efibootmgr -o write but applies
+# the second (retry).  Verify1 shows wrong order; verify2 shows correct order;
+# no warning should fire.
+# Mock sequence: call 1=query, 2=create, 3=post-create read, 4=-o set,
+# 5=verify1 (wrong), 6=retry -o, 7=verify2 (correct) -> no warn.
+: > "${MOCK_CALL_LOG}"
+cat > "${MOCK_BIN}/efibootmgr" << MOCK_EOF
+#!/bin/sh
+echo "efibootmgr \$*" >> "\${MOCK_CALL_LOG}"
+_n=\$(grep -c "^efibootmgr" "\${MOCK_CALL_LOG}" 2>/dev/null || echo 0)
+case "\${_n}" in
+    1) cat "${FIXTURES_DIR}/efibootmgr_no_freebsd.txt" ; exit 0 ;;
+    2) exit 0 ;;
+    3) printf 'BootOrder  : 0005, 0001, 0000\n' ; exit 0 ;;
+    4) exit 0 ;;
+    5) printf 'BootOrder  : 0005, 0001, 0000\n' ; exit 0 ;;
+    6) exit 0 ;;
+    7) printf 'BootOrder  : 0001, 0000, 0005\n' ; exit 0 ;;
+    *) exit 0 ;;
+esac
+MOCK_EOF
+chmod +x "${MOCK_BIN}/efibootmgr"
+hash -r 2>/dev/null || true
+EFI_DRY_RUN=0
+_warn17=$(efi_ensure_nvram_entry "${_ESP_MOUNT}" "${_LOADER_ABS}" \
+    "BOOTx64.efi" "0" 2>&1)
+_has_warn17=$(printf '%s\n' "${_warn17}" | grep -c "BootOrder not preserved" 2>/dev/null || true)
+assert_eq \
+    "BootOrder corrected on retry -> no preservation warning emitted" \
+    "${_has_warn17}" "0"
 
 tap_end
 
