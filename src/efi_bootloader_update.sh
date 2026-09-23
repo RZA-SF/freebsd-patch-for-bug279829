@@ -1218,8 +1218,9 @@ efi_ensure_nvram_entry() {
     [ "$_inserted" = "0" ] && _rebuilt="${_rebuilt:+${_rebuilt},}${_new_num}"
 
     if efibootmgr -o "$_rebuilt" >/dev/null 2>&1; then
-        # Verify the original default is still first — some firmware ignores
-        # BootOrder writes (e.g. ASUS boards with aggressive auto-recovery).
+        # Verify the original default is still first.  Some firmware (e.g.
+        # ASUS boards with aggressive auto-recovery) ignores BootOrder writes;
+        # retry once before warning so transient delays are handled cleanly.
         local _post_first
         _post_first=$(efibootmgr 2>/dev/null | awk '/^BootOrder[[:space:]]*:/{
             sub(/^BootOrder[[:space:]]*:[[:space:]]*/,"")
@@ -1227,9 +1228,17 @@ efi_ensure_nvram_entry() {
             print $1; exit}')
         if [ -n "$_original_default" ] && [ -n "$_post_first" ] && \
            [ "$_post_first" != "$_original_default" ]; then
-            _efi_warn "BootOrder not preserved — default boot entry is now Boot${_post_first}"
-            _efi_warn "Previous default was Boot${_original_default}"
-            _efi_warn "To restore: efibootmgr -o $(printf '%s\n' "$_boot_order" | tr ' ' ',')"
+            _efi_info "BootOrder correction not reflected — retrying"
+            efibootmgr -o "$_rebuilt" >/dev/null 2>&1
+            _post_first=$(efibootmgr 2>/dev/null | awk '/^BootOrder[[:space:]]*:/{
+                sub(/^BootOrder[[:space:]]*:[[:space:]]*/,"")
+                gsub(/,[[:space:]]*/," ")
+                print $1; exit}')
+            if [ -n "$_post_first" ] && [ "$_post_first" != "$_original_default" ]; then
+                _efi_warn "BootOrder not preserved after two attempts — firmware is overriding writes"
+                _efi_warn "Default boot entry is Boot${_post_first}; previous default was Boot${_original_default}"
+                _efi_warn "To restore: efibootmgr -o $(printf '%s\n' "$_boot_order" | tr ' ' ',')"
+            fi
         fi
     else
         _efi_warn "efibootmgr: could not set BootOrder — entry created but order not adjusted"
