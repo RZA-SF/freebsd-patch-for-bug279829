@@ -125,7 +125,7 @@ any other OS might overwrite.
 
 The script is a single POSIX sh file that can be:
 
-1. **Executed directly:** `sh efi_bootloader_update.sh [--dry-run] [--verbose]`
+1. **Executed directly:** `sh efi_bootloader_update.sh [--dry-run|--confirm-update] [--verbose]`
 2. **Sourced by freebsd-update:** `. /usr/libexec/efi_bootloader_update.sh && update_bootloaders`
 
 The guard `[ -n "${_EFI_BOOTLOADER_UPDATE_SH:-}" ] && return 0` at the top
@@ -133,6 +133,22 @@ prevents double-sourcing (important when freebsd-update sources it in a loop).
 
 The standalone entry point (bottom of file) detects invocation via
 `$0` matching the script name, parses flags, and calls `update_bootloaders`.
+
+**Default behavior when invoked directly:** If neither `--dry-run` nor
+`--confirm-update` is passed (and neither `EFI_DRY_RUN` nor
+`EFI_CONFIRM_UPDATE` is set), `EFI_DRY_RUN=1` is applied automatically.
+This makes direct invocations safe by default — no writes occur without
+explicit opt-in.  `freebsd-update` sets the appropriate env var based on
+the `UpdateBootloader` conf value before sourcing the script.
+
+| Flag / env var | Effect |
+|---|---|
+| `--dry-run` / `EFI_DRY_RUN=1` | Evaluate; no writes; print notice if update needed |
+| `--confirm-update` / `EFI_CONFIRM_UPDATE=1` | Perform write |
+| (none) | Equivalent to `--dry-run` |
+
+`EFI_DRY_RUN=1` takes precedence over `EFI_CONFIRM_UPDATE=1` when both are
+set; a warning is emitted and `EFI_CONFIRM_UPDATE` is cleared.
 
 ### 3.2 Function Categories
 
@@ -208,6 +224,10 @@ Four module-level variables track the current ESP mount operation:
   when the "mountpoint" is an empty tmpdir. Used to suppress dry-run notices
   that are only appropriate when the ESP is not accessible.
 - `_efi_tmp_mounts` — space-separated list of all temp mounts (for EXIT trap)
+- `_efi_dry_run_pending` — count of files that would be updated in dry-run
+  mode (incremented by `efi_safe_copy` when `cmp -s` fails and `EFI_DRY_RUN=1`);
+  reset to 0 at the start of each `update_bootloaders` call; controls whether
+  the advisory modal fires at the end of the run
 
 ---
 
@@ -1078,3 +1098,110 @@ both of which cause `efi_safe_copy` to skip the copy with a warning:
    output string ever changes, `efi_is_signed` emits a diagnostic warning and
    treats the result as indeterminate; the copy is skipped rather than
    proceeding on an unverified assumption.
+
+### 7.6 Dry-Run Default and Advisory Modal (Revision-8)
+
+#### Motivation
+
+During reviews of D58990, feedback was provided that an opt-in approach
+would be a better way to introduce this feature and give users more time to
+evaluate it in their environments.  Shipping with dry-run as the default
+means systems receive the evaluation and notification machinery immediately,
+while the write path remains opt-in.  This allows operators to observe the
+feature's behavior across a range of hardware and configurations before
+committing to automatic writes — and then enable it once they are confident
+in the results.
+
+#### Three-value `UpdateBootloader` conf key
+
+`freebsd-update.conf` already supports non-boolean values (`ServerName`,
+`Components`, `WorkDir`, etc.).  The `UpdateBootloader` key is extended to
+three values:
+
+| Value | Behavior |
+|---|---|
+| `dry-run` | Evaluate; no writes; print advisory modal if update needed (**default**) |
+| `yes` | Perform write automatically |
+| `no` | Disable all bootloader updates |
+
+`freebsd-update` translates the conf value to env vars before sourcing the
+script:
+
+- `UpdateBootloader dry-run` → sets `EFI_DRY_RUN=1`
+- `UpdateBootloader yes` → sets `EFI_CONFIRM_UPDATE=1`
+- `UpdateBootloader no` → does not call the script
+
+#### Dry-run accuracy — `cmp -s` moved before the dry-run gate
+
+In earlier revisions, `efi_safe_copy` checked the dry-run flag first and
+unconditionally reported "Would update" for every candidate file.  This
+produced false positives: if the ESP already contained the current loader,
+dry-run still reported an update as needed.
+
+The fix: `cmp -s "$src" "$dst"` is evaluated **before** the dry-run gate.
+If the files are identical, `efi_safe_copy` returns 0 immediately (already
+up to date) without incrementing `_efi_dry_run_pending`.  The advisory modal
+only fires when there is a genuine pending write.
+
+#### Advisory modal (`_efi_modal`)
+
+When `update_bootloaders` completes in dry-run mode and
+`_efi_dry_run_pending > 0`, it calls `_efi_modal` which:
+
+1. Prints a bordered ASCII notice to stdout — visible in interactive
+   terminal sessions and captured by `freebsd-update`'s own output.
+2. Calls `logger(1)` with priority `daemon.warn` and tag
+   `efi_bootloader_update` (matching the script filename) — ensuring
+   the advisory is persisted in syslog for automated runs (cron, remote
+   upgrades, headless servers) where console output may be missed.
+   The syslog tag makes the source unambiguous:
+   ```
+   Sep 26 12:34:56 hostname efi_bootloader_update: EFI bootloader update \
+       recommended — apply before rebooting (dry-run, no changes made)
+   ```
+
+When dry-run finds no pending writes (all ESP files already current), the
+modal is suppressed entirely; only an informational line is emitted.
+
+When `--confirm-update` / `EFI_CONFIRM_UPDATE=1` is used and the update
+succeeds, there is no stdout modal; a `daemon.notice` syslog entry is
+written to record the successful update.
+
+Modal format (Variation B):
+
+```
+*** ============================================================
+*** NOTICE: EFI bootloader update recommended
+*** ============================================================
+***
+*** ------------------------------------------------------------
+*** WARNING: No changes were made (dry-run mode).
+*** Update the bootloader BEFORE rebooting into the new kernel.
+*** Failure to do so may result in a boot failure.
+*** ------------------------------------------------------------
+***
+*** To apply now (as root):
+***   sh /usr/libexec/efi_bootloader_update.sh --confirm-update
+***
+*** To apply automatically on future upgrades:
+***   Set  UpdateBootloader yes  in /etc/freebsd-update.conf
+*** ============================================================
+```
+
+The `***` prefix is visually distinct from normal script output and does
+not conflict with standard log formats.
+
+#### Precedence rule
+
+`EFI_DRY_RUN=1` always wins over `EFI_CONFIRM_UPDATE=1` when both are
+set simultaneously.  A warning is emitted and `EFI_CONFIRM_UPDATE` is
+cleared.  This guarantees the safer outcome when both are accidentally set
+(e.g., an operator exports both from a wrapper script).
+
+#### pkgbase / direct-call safety
+
+pkgbase users call `efi_bootloader_update.sh` directly; they do not go
+through `freebsd-update.conf`.  Because the default (no flags, no env vars)
+is now dry-run, direct invocations are safe without any configuration.
+Operators explicitly opt in to writes with `--confirm-update` or
+`EFI_CONFIRM_UPDATE=1`.

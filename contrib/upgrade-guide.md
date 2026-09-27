@@ -125,7 +125,7 @@ fetch -o /tmp/efi_bootloader_update.sh \
 sh /tmp/efi_bootloader_update.sh --dry-run --verbose
 
 # Apply
-sh /tmp/efi_bootloader_update.sh
+sh /tmp/efi_bootloader_update.sh --confirm-update
 
 # Then reboot
 reboot

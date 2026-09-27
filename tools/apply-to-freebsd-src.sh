@@ -59,9 +59,15 @@ echo "--> freebsd-update.conf: adding UpdateBootloader and UpdateBootloaderNVRAM
 cat >> "${TARGET}/freebsd-update.conf" << 'EOF'
 
 # Automatically update the EFI bootloader on the ESP and BIOS bootcode on
-# freebsd-boot partitions when installing updates.  Disable only if you manage
-# bootloaders manually or use a custom boot configuration.
-# UpdateBootloader yes
+# freebsd-boot partitions when installing updates.
+#
+# dry-run  Evaluate and report what would be updated; no writes made.
+#          A prominent notice is printed if an update is recommended,
+#          with instructions to apply it before the next reboot.
+# yes      Perform the update automatically.
+# no       Disable bootloader updates entirely.
+#
+# UpdateBootloader dry-run
 
 # Set to no to skip NVRAM boot entry management while still updating ESP files.
 # Use when NVRAM entries are managed externally (BMC, Ansible, iDRAC, etc.) or
@@ -94,6 +100,9 @@ awk '
     print "\t\t\t;;"
     print "\t\t[Nn][Oo])"
     print "\t\t\tUPDATEBOOTLOADER=no"
+    print "\t\t\t;;"
+    print "\t\t[Dd][Rr][Yy]-[Rr][Uu][Nn])"
+    print "\t\t\tUPDATEBOOTLOADER=dry-run"
     print "\t\t\t;;"
     print "\t\t*)"
     print "\t\t\treturn 1"
@@ -129,11 +138,11 @@ awk '
 mv "${TARGET}/freebsd-update.sh.new" "${TARGET}/freebsd-update.sh"
 
 # ── 5. freebsd-update.sh — default config ────────────────────────────────────
-echo "--> freebsd-update.sh: adding default config_UpdateBootloader yes and config_UpdateBootloaderNVRAM yes"
+echo "--> freebsd-update.sh: adding default config_UpdateBootloader dry-run and config_UpdateBootloaderNVRAM yes"
 awk '
 /^\tconfig_CreateBootEnv yes$/ && !done {
     print
-    print "\tconfig_UpdateBootloader yes"
+    print "\tconfig_UpdateBootloader dry-run"
     print "\tconfig_UpdateBootloaderNVRAM yes"
     done=1
     next
@@ -148,7 +157,7 @@ awk '
 /^install_run \(\) \{$/ && !fn_done {
     print "# Update EFI and BIOS bootloaders after the new world/kernel is installed."
     print "# Sources /usr/libexec/efi_bootloader_update.sh to allow independent testing."
-    print "# Controlled by UpdateBootloader in freebsd-update.conf (default: yes)."
+    print "# Controlled by UpdateBootloader in freebsd-update.conf (default: dry-run)."
     print "update_bootloaders_after_install () {"
     print "\tif [ \"${UPDATEBOOTLOADER}\" = \"no\" ]; then"
     print "\t\treturn 0"
@@ -157,6 +166,17 @@ awk '
     print "\tif [ \"${UPDATEBOOTLOADERNVRAM}\" = \"no\" ]; then"
     print "\t\tEFI_NVRAM_UPDATE=0"
     print "\t\texport EFI_NVRAM_UPDATE"
+    print "\tfi"
+    print ""
+    print "\t# Translate conf value to env var for efi_bootloader_update.sh."
+    print "\t# dry-run: evaluate only; yes: perform write."
+    print "\tif [ \"${UPDATEBOOTLOADER}\" = \"dry-run\" ]; then"
+    print "\t\tEFI_DRY_RUN=1"
+    print "\t\texport EFI_DRY_RUN"
+    print "\telse"
+    print "\t\t# UpdateBootloader yes"
+    print "\t\tEFI_CONFIRM_UPDATE=1"
+    print "\t\texport EFI_CONFIRM_UPDATE"
     print "\tfi"
     print ""
     print "\t_efi_lib=\"${BASEDIR}/usr/libexec/efi_bootloader_update.sh\""
@@ -170,7 +190,7 @@ awk '
     print "\t# shellcheck source=/usr/libexec/efi_bootloader_update.sh"
     print "\t. \"${_efi_lib}\""
     print "\tupdate_bootloaders || true   # warnings already printed; never block install"
-    print "\tunset _efi_lib"
+    print "\tunset _efi_lib EFI_DRY_RUN EFI_CONFIRM_UPDATE"
     print "}"
     print ""
     fn_done=1
@@ -189,23 +209,52 @@ awk '
 mv "${TARGET}/freebsd-update.sh.new" "${TARGET}/freebsd-update.sh"
 
 # ── 7. freebsd-update.8 — install command description ────────────────────────
-echo "--> freebsd-update.8: adding install command description"
+echo "--> freebsd-update.8: adding install command description (revision-8: three-value UpdateBootloader)"
 awk '
 /^\.It Cm rollback$/ && !done {
     print ".Pp"
     print "After installing updates,"
     print ".Nm"
-    print "automatically updates the EFI bootloader on the EFI System Partition (ESP)"
+    print "evaluates whether the EFI bootloader on the EFI System Partition (ESP)"
     print "and the BIOS bootcode on"
     print ".Xr gpart 8"
     print ".Dq freebsd-boot"
-    print "partitions."
+    print "partitions need to be updated."
     print "This ensures the firmware-facing bootloader is consistent with the newly"
     print "installed"
     print ".Pa /boot/loader.efi"
     print "and Lua scripts, preventing boot failures after major version upgrades."
     print "EFI binaries that carry a Secure Boot signature are not overwritten;"
     print "a warning is emitted and the signed binary is left unchanged."
+    print ".Pp"
+    print "The"
+    print ".Cm UpdateBootloader"
+    print "option in"
+    print ".Xr freebsd-update.conf 5"
+    print "controls bootloader update behavior and accepts three values:"
+    print ".Bl -tag -width \"dry-run\""
+    print ".It Cm dry-run"
+    print "Evaluate what would be updated and report the result; no writes are made."
+    print "If an update is recommended, a prominent notice is printed to the console"
+    print "and recorded via"
+    print ".Xr syslog 3"
+    print "at"
+    print ".Dv daemon.warn ,"
+    print "with instructions to apply the update before rebooting."
+    print "This is the default."
+    print ".It Cm yes"
+    print "Perform the bootloader update automatically."
+    print "A"
+    print ".Dv daemon.notice"
+    print "syslog entry is written on success."
+    print ".It Cm no"
+    print "Disable bootloader updates entirely."
+    print ".El"
+    print ".Pp"
+    print "To apply a pending bootloader update immediately (as root):"
+    print ".Pp"
+    print ".Dl sh /usr/libexec/efi_bootloader_update.sh --confirm-update"
+    print ".Pp"
     print "To skip only NVRAM boot entry management while still updating ESP files,"
     print "set"
     print ".Cm UpdateBootloaderNVRAM no"
@@ -216,10 +265,6 @@ awk '
     print "or when the firmware\\(aqs"
     print ".Dv SetVariable"
     print "implementation is unreliable."
-    print "To disable bootloader updates entirely, set"
-    print ".Cm UpdateBootloader no"
-    print "in"
-    print ".Xr freebsd-update.conf 5 ."
     done=1
 }
 { print }
@@ -238,6 +283,19 @@ awk '
     print "to update bootloaders on the ESP and"
     print ".Dq freebsd-boot"
     print "partitions."
+    print "The script may also be invoked directly."
+    print "With no arguments or"
+    print ".Fl -dry-run ,"
+    print "it evaluates what would be updated without making any changes."
+    print "With"
+    print ".Fl -confirm-update ,"
+    print "it performs the update."
+    print "The"
+    print ".Ev EFI_DRY_RUN"
+    print "and"
+    print ".Ev EFI_CONFIRM_UPDATE"
+    print "environment variables are equivalent to the respective flags and are"
+    print "suitable for scripted callers that cannot pass flags directly."
     print ".El"
     lib_done=1
     next

@@ -15,7 +15,7 @@ TESTS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "${TESTS_DIR}/lib/mock_framework.sh"
 SRC_DIR="$(cd "${TESTS_DIR}/../src" && pwd)"
 
-tap_begin 6
+tap_begin 18
 
 setup_test_dir
 mock_init
@@ -107,7 +107,12 @@ case "$*" in
     *) exit 0 ;;
 esac'
 mock_cmd_output sync ""
-mock_cmd stat 'echo "512"'
+mock_cmd stat '
+case "$*" in
+    *%Sm*) echo "2025-04-08 14:02 UTC" ;;
+    *)     echo "512" ;;
+esac'
+mock_cmd_output logger ""   # absorb _efi_modal syslog calls
 
 # --- Source script ---
 unset _EFI_BOOTLOADER_UPDATE_SH
@@ -151,6 +156,64 @@ assert_file_not_exists \
 assert_file_not_exists \
     "EFI/BOOT/BOOTx64.efi NOT written in dry-run (fake MP is empty)" \
     "${FAKE_MP}/EFI/BOOT/BOOTx64.efi"
+
+# ── Modal content validation (Variation B format) ────────────────────────────
+# These assertions verify the exact user-visible strings in the modal.
+# Regressions here break the critical user-facing notification.
+
+assert_contains \
+    "dry-run modal: NOTICE header present" \
+    "${_output}" "*** NOTICE: EFI bootloader update recommended"
+
+assert_contains \
+    "dry-run modal: top/bottom border present (=== line)" \
+    "${_output}" "*** ============================================================"
+
+assert_contains \
+    "dry-run modal: WARNING sub-border present (--- line)" \
+    "${_output}" "*** ------------------------------------------------------------"
+
+assert_contains \
+    "dry-run modal: WARNING text — no changes made" \
+    "${_output}" "*** WARNING: No changes were made (dry-run mode)."
+
+assert_contains \
+    "dry-run modal: WARNING text — reboot risk" \
+    "${_output}" "*** Failure to do so may result in a boot failure."
+
+assert_contains \
+    "dry-run modal: --confirm-update apply instruction present" \
+    "${_output}" "--confirm-update"
+
+assert_contains \
+    "dry-run modal: UpdateBootloader yes conf instruction present" \
+    "${_output}" "UpdateBootloader yes"
+
+# Modal fires syslog: logger must have been called (daemon.warn notification)
+assert_true \
+    "dry-run modal: logger called for syslog notification" \
+    mock_was_called logger
+
+# ── Per-ESP detail lines (Variation B format) ─────────────────────────────────
+# These lines appear between the NOTICE header and the WARNING block.
+# They identify the affected ESP, the installed vs available loader paths,
+# and the fingerprint evidence used to confirm ownership.
+
+assert_contains \
+    "dry-run modal: ESP device/mountpoint line present" \
+    "${_output}" "*** ESP:"
+
+assert_contains \
+    "dry-run modal: Installed loader path line present" \
+    "${_output}" "*** Installed:"
+
+assert_contains \
+    "dry-run modal: Available source path line present" \
+    "${_output}" "*** Available:"
+
+assert_contains \
+    "dry-run modal: FreeBSD fingerprint evidence line present" \
+    "${_output}" "*** FreeBSD:"
 
 # --- Cleanup ---
 EFI_DRY_RUN=0

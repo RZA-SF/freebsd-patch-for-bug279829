@@ -11,7 +11,7 @@ notes and bug narratives follow in the [contributor sections](#contributor-detai
 ## Coverage Matrix
 
 Each row is one test environment. **Suite** = `./tests/run_tests.sh` pass
-count on that FreeBSD version at time of testing (current suite: 335 tests).
+count on that FreeBSD version at time of testing (current suite: 371 tests).
 **Run** = live or dry-run execution on real hardware/cloud. **Bugs** = fix
 revisions first surfaced by this environment (full narratives in the detail
 sections).
@@ -25,8 +25,8 @@ sections).
 | marklmi | Raspberry Pi 3B | arm64 | 14.5-BETA2 | UFS | MBR | EFI (U-Boot) | — | ✓ live | R-11 |
 | marklmi | Honeycomb LX2160A | arm64 | main | UFS | GPT | EFI | — | ✓ live | R-08 |
 | Stefan | amd64 workstation (3-disk, diskid/ vdevs) | amd64 | CURRENT | ZFS | GPT | EFI | — | ✓ live | R-15, R-16 |
-| RZA-SF | Physical workstation | amd64 | 14.0-RELEASE-p11 | ZFS | GPT | EFI+BIOS | 335/335 | suite + dry-run (live hardware) | R-01, R-02 |
-| RZA-SF | Physical workstation | amd64 | 15.1-RELEASE-p3 | ZFS | GPT | EFI+BIOS | 335/335 | suite + dry-run (live hardware) | — |
+| RZA-SF | Physical workstation | amd64 | 14.0-RELEASE-p11 | ZFS | GPT | EFI+BIOS | 371/371 | suite + dry-run (live hardware) | R-01, R-02 |
+| RZA-SF | Physical workstation | amd64 | 15.1-RELEASE-p3 | ZFS | GPT | EFI+BIOS | 371/371 | suite + dry-run (live hardware) | — |
 | RZA-SF | AWS Graviton EC2 | aarch64 | 13.5-RELEASE | UFS | GPT | EFI | 291/291 | dry-run | R-17 |
 | RZA-SF | AWS Graviton EC2 | aarch64 | 14.4-RELEASE-p9 | UFS | GPT | EFI | 291/291 | dry-run | — |
 | RZA-SF | AWS Graviton EC2 | aarch64 | 14.4-RELEASE-p9 | ZFS | GPT | EFI | 291/291 | dry-run | — |
@@ -1071,8 +1071,12 @@ Chronological record of all test suite runs across the development of this patch
 | 2026-09-10 | amd64 | 15.1-RELEASE-p3 | Physical workstation (felix) | ZFS | EFI+BIOS | dry-run | revision-6: gpart --libxo json (15.x); gpt/efiboot0 glabel; ia32 gate fires; Guard 1 fires (fallback_is_freebsd=1); BIOS gptzfsboot nda0p2; uefisign not called in dry-run path |
 | 2026-09-23 | amd64 | 14.0-RELEASE-p11 | Physical workstation (patient zero) | ZFS | EFI+BIOS | ✓ 335/335 | revision-7: efi_is_signed output parsing + BootOrder preservation hardening; 48 files, 0 failed, 0 skipped |
 | 2026-09-23 | amd64 | 14.0-RELEASE-p11 | Physical workstation (patient zero) | ZFS | EFI+BIOS | dry-run | revision-7: gpart text fallback (14.0); gpt/efiboot0 glabel; Guard 1 fires (fallback_is_freebsd=1, NVRAM skipped); BIOS gptzfsboot nda0p2; dry-run clean |
+| 2026-09-26 | amd64 | 14.0-RELEASE-p11 | Physical workstation (patient zero) | ZFS | EFI+BIOS | ✓ 371/371 | revision-8: dry-run default, UpdateBootloader three-value, per-ESP modal detail lines; 51 files, 0 failed, 0 skipped |
+| 2026-09-26 | amd64 | 14.0-RELEASE-p11 | Physical workstation (patient zero) | ZFS | EFI+BIOS | dry-run | revision-8: modal fires (post-`freebsd-update install`, ESP stale); installed 2026-08-17 vs available 2026-09-26; both EFI copies would update; gpart text fallback (--libxo absent on 14.0); Guard 1 fires (fallback_is_freebsd=1, NVRAM skipped); BIOS gptzfsboot nda0p2 dry-run; bootprog_info match |
 | 2026-09-23 | amd64 | 15.1-RELEASE-p3 | Physical workstation (felix) | ZFS | EFI+BIOS | ✓ 335/335 | revision-7: efi_is_signed output parsing + BootOrder preservation hardening; 48 files, 0 failed, 0 skipped |
 | 2026-09-23 | amd64 | 15.1-RELEASE-p3 | Physical workstation (felix) | ZFS | EFI+BIOS | dry-run | revision-7: gpart --libxo json (15.x); gpt/efiboot0 glabel; ia32 gate fires (source present, no BOOTia32.efi); Guard 1 fires (fallback_is_freebsd=1); BIOS gptzfsboot nda0p2; Windows Boot Manager on separate disk (Boot0000 not on root disk) |
+| 2026-09-26 | amd64 | 15.1-RELEASE-p3 | Physical workstation (felix) | ZFS | EFI+BIOS | ✓ 371/371 | revision-8: dry-run default, UpdateBootloader three-value, per-ESP modal detail lines; 51 files, 0 failed, 0 skipped |
+| 2026-09-26 | amd64 | 15.1-RELEASE-p3 | Physical workstation (felix) | ZFS | EFI+BIOS | dry-run | revision-8: modal fires correctly; detail block shows installed 2026-03-29 vs available 2026-06-14 (genuine pending update); bootprog_info match; Guard 1 fires (fallback_is_freebsd=1, NVRAM skipped); ia32 gate fires (source present, no BOOTia32.efi); BIOS gptzfsboot nda0p2 dry-run |
 
 ---
 

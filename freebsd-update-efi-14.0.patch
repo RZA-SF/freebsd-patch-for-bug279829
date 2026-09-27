@@ -14,10 +14,10 @@ index 14e522adb1a0..7969f19fc4a1 100644
  .include <bsd.prog.mk>
 diff --git a/usr.sbin/freebsd-update/efi_bootloader_update.sh b/usr.sbin/freebsd-update/efi_bootloader_update.sh
 new file mode 100644
-index 000000000000..3efe34ccf353
+index 000000000000..2ceda9e9688f
 --- /dev/null
 +++ b/usr.sbin/freebsd-update/efi_bootloader_update.sh
-@@ -0,0 +1,1600 @@
+@@ -0,0 +1,1761 @@
 +#!/bin/sh
 +#
 +# SPDX-License-Identifier: BSD-2-Clause
@@ -37,6 +37,7 @@ index 000000000000..3efe34ccf353
 +
 +: "${EFI_LOADER_SRC:=/boot/loader.efi}"
 +: "${EFI_DRY_RUN:=0}"
++: "${EFI_CONFIRM_UPDATE:=0}"  # Set to 1 to perform writes; equivalent to --confirm-update
 +: "${EFI_VERBOSE:=0}"
 +: "${EFI_NVRAM_UPDATE:=1}"     # Set to 0 to skip NVRAM boot entry management
 +: "${EFI_BIOS_PMBR:=/boot/pmbr}"
@@ -87,6 +88,69 @@ index 000000000000..3efe34ccf353
 +_efi_warn() { _efi_log "WARN:  $*" >&2; }
 +_efi_err()  { _efi_log "ERROR: $*" >&2; }
 +_efi_verb() { [ "${EFI_VERBOSE}" = "1" ] && _efi_log "DEBUG: $*" || true; }
++
++# Count of pending writes detected during a dry-run pass.  Reset to 0 at the
++# start of each update_bootloaders() call; incremented by efi_safe_copy when
++# EFI_DRY_RUN=1 and a write would have occurred.  Drives the modal notification.
++_efi_dry_run_pending=0
++
++# Per-ESP count of pending writes; reset before each ESP iteration in
++# update_bootloaders().  Used to decide whether to collect detail lines.
++_efi_dry_run_pending_esp=0
++
++# Accumulated per-ESP detail lines for the dry-run modal.  Each block is
++# collected after efi_update_esp returns.  Multi-line; uses literal embedded
++# newlines for POSIX sh portability.
++_efi_dry_run_details=""
++
++# Fingerprint evidence from the most recent successful efi_is_freebsd_loader()
++# call.  Set to "bootprog_info match" or "N/M heuristic match".  Reset before
++# each ESP iteration in update_bootloaders().
++_efi_last_fingerprint=""
++
++# _efi_modal_line LINE
++# Prints one line of modal body content to stdout, prefixed with "*** ".
++_efi_modal_line() { printf '*** %s\n' "$*"; }
++
++# _efi_modal SYSLOG_SUMMARY LINE [LINE ...]
++#
++# Emits a prominent bordered notification block to stdout and writes a
++# single-line summary to syslog at daemon.warn priority.
++#
++# stdout is used (not stderr) so the block is visible in any terminal session
++# and can be captured by automated tooling that captures stdout.  syslog
++# provides persistence for unattended/cron invocations where console output
++# is not reviewed.
++_efi_modal() {
++    _modal_summary="$1"; shift
++    printf '\n'
++    while [ $# -gt 0 ]; do
++        _efi_modal_line "$1"
++        shift
++    done
++    printf '\n'
++    logger -p daemon.warn -t efi_bootloader_update "$_modal_summary"
++}
++
++# _efi_mtime FILE
++# Prints the modification timestamp of FILE as "YYYY-MM-DD HH:MM UTC".
++# Returns empty on error or absent file.  Uses FreeBSD stat(1) syntax;
++# silently produces no output on Linux development machines.
++_efi_mtime() {
++    stat -f "%Sm" -t "%Y-%m-%d %H:%M %Z" "$1" 2>/dev/null || true
++}
++
++# _efi_detail_append LINE
++# Appends LINE to _efi_dry_run_details using a literal embedded newline
++# for POSIX sh portability (no printf %b, no $'...').
++_efi_detail_append() {
++    if [ -z "$_efi_dry_run_details" ]; then
++        _efi_dry_run_details="$1"
++    else
++        _efi_dry_run_details="${_efi_dry_run_details}
++$1"
++    fi
++}
 +
 +# ============================================================
 +# ARCHITECTURE → EFI BINARY MAPPING
@@ -935,6 +999,7 @@ index 000000000000..3efe34ccf353
 +    # Primary: match the bootprog_info pattern.
 +    if strings "$file" 2>/dev/null | grep -qE 'FreeBSD/[^ ]+ EFI[ ,]'; then
 +        _efi_verb "Fingerprint '${file}': bootprog_info match"
++        _efi_last_fingerprint="bootprog_info match"
 +        return 0
 +    fi
 +
@@ -946,7 +1011,11 @@ index 000000000000..3efe34ccf353
 +    done
 +
 +    _efi_verb "Fingerprint '${file}': ${matches}/${_EFI_FINGERPRINT_THRESHOLD} heuristic match(es)"
-+    [ "$matches" -ge "${_EFI_FINGERPRINT_THRESHOLD}" ]
++    if [ "$matches" -ge "${_EFI_FINGERPRINT_THRESHOLD}" ]; then
++        _efi_last_fingerprint="${matches}/${_EFI_FINGERPRINT_THRESHOLD} heuristic match"
++        return 0
++    fi
++    return 1
 +}
 +
 +# Returns 0 if the given EFI binary carries an Authenticode / Secure Boot
@@ -1034,15 +1103,19 @@ index 000000000000..3efe34ccf353
 +    # current) or dry-run.  Callers use this to count actual writes.
 +    _efi_copy_wrote=0
 +
-+    if [ "${EFI_DRY_RUN}" = "1" ]; then
-+        _efi_info "[DRY RUN] Would update: ${dst}"
++    # Skip the copy if the destination already matches the source.
++    # Checked before the dry-run gate so dry-run reports accurately: a file
++    # that is already current is silently skipped in both modes, and the
++    # dry-run modal only fires when writes would actually be needed.
++    if [ -f "$dst" ] && cmp -s "$src" "$dst" 2>/dev/null; then
++        _efi_verb "Already up to date: ${dst}"
 +        return 0
 +    fi
 +
-+    # Skip the copy if the destination already matches the source.
-+    # Avoids unnecessary FAT32 writes on repeated freebsd-update install runs.
-+    if [ -f "$dst" ] && cmp -s "$src" "$dst" 2>/dev/null; then
-+        _efi_verb "Already up to date: ${dst}"
++    if [ "${EFI_DRY_RUN}" = "1" ]; then
++        _efi_info "[DRY RUN] Would update: ${dst}"
++        _efi_dry_run_pending=$((_efi_dry_run_pending + 1))
++        _efi_dry_run_pending_esp=$((_efi_dry_run_pending_esp + 1))
 +        return 0
 +    fi
 +
@@ -1485,6 +1558,10 @@ index 000000000000..3efe34ccf353
 +# Returns 0 if all updates succeeded, 1 if any failed.
 +update_bootloaders() {
 +    local total_errors=0
++    _efi_dry_run_pending=0
++    _efi_dry_run_pending_esp=0
++    _efi_dry_run_details=""
++    _efi_last_fingerprint=""
 +
 +    # ── Prerequisites ──────────────────────────────────────────────────────────
 +    local rc
@@ -1537,8 +1614,36 @@ index 000000000000..3efe34ccf353
 +                    continue
 +                fi
 +
++                _efi_dry_run_pending_esp=0
++                _efi_last_fingerprint=""
++
 +                efi_update_esp "$esp_mp" "$fallback_binary" "$esp_disk" "$esp_pidx" "$esp_scheme" || \
 +                    total_errors=$((total_errors + 1))
++
++                # Collect per-ESP detail lines for the dry-run modal.
++                if [ "${EFI_DRY_RUN}" = "1" ] && \
++                   [ "${_efi_dry_run_pending_esp}" -gt 0 ]; then
++                    local _esp_dev _inst_abs _inst_rel _inst_mt _avail_mt _fp
++                    case "$esp_scheme" in
++                        MBR) _esp_dev="/dev/${esp_disk}s${esp_pidx}" ;;
++                        *)   _esp_dev="/dev/${esp_disk}p${esp_pidx}" ;;
++                    esac
++                    _inst_abs="${esp_mp}/EFI/FreeBSD/loader.efi"
++                    _inst_rel="EFI/FreeBSD/loader.efi"
++                    _inst_mt=$(_efi_mtime "$_inst_abs")
++                    _avail_mt=$(_efi_mtime "${EFI_LOADER_SRC}")
++                    _fp="${_efi_last_fingerprint:-ESP topology (gpart)}"
++                    [ -n "${_efi_dry_run_details}" ] && \
++                        _efi_detail_append ""
++                    _efi_detail_append "ESP:       ${_esp_dev}  (${esp_mp})"
++                    _efi_detail_append "Installed: ${_inst_rel}"
++                    [ -n "${_inst_mt}" ] && \
++                        _efi_detail_append "           ${_inst_mt}"
++                    _efi_detail_append "Available: ${EFI_LOADER_SRC}"
++                    [ -n "${_avail_mt}" ] && \
++                        _efi_detail_append "           ${_avail_mt}"
++                    _efi_detail_append "FreeBSD:   fingerprint confirmed (${_fp})"
++                fi
 +
 +                efi_unmount_esp
 +            done <<_ESPS_
@@ -1569,9 +1674,42 @@ index 000000000000..3efe34ccf353
 +    fi
 +
 +    if [ "${EFI_DRY_RUN}" = "1" ]; then
-+        _efi_info "[DRY RUN] Bootloader update complete (no changes made)"
++        if [ "${_efi_dry_run_pending}" -gt 0 ]; then
++            # Emit modal to stdout + syslog.  Detail lines (_efi_dry_run_details)
++            # are rendered inline because they contain newlines and cannot be
++            # passed as individual arguments to _efi_modal().
++            logger -p daemon.warn -t efi_bootloader_update \
++                "EFI bootloader update recommended — apply before rebooting (dry-run, no changes made)"
++            printf '\n'
++            _efi_modal_line "============================================================"
++            _efi_modal_line "NOTICE: EFI bootloader update recommended"
++            _efi_modal_line "============================================================"
++            if [ -n "${_efi_dry_run_details}" ]; then
++                _efi_modal_line ""
++                printf '%s\n' "${_efi_dry_run_details}" | while IFS= read -r _dl; do
++                    _efi_modal_line "${_dl}"
++                done
++            fi
++            _efi_modal_line "------------------------------------------------------------"
++            _efi_modal_line "WARNING: No changes were made (dry-run mode)."
++            _efi_modal_line "Update the bootloader BEFORE rebooting into the new kernel."
++            _efi_modal_line "Failure to do so may result in a boot failure."
++            _efi_modal_line "------------------------------------------------------------"
++            _efi_modal_line ""
++            _efi_modal_line "To apply now (as root):"
++            _efi_modal_line "  sh /usr/libexec/efi_bootloader_update.sh --confirm-update"
++            _efi_modal_line ""
++            _efi_modal_line "To apply automatically on future upgrades:"
++            _efi_modal_line "  Set  UpdateBootloader yes  in /etc/freebsd-update.conf"
++            _efi_modal_line "============================================================"
++            printf '\n'
++        else
++            _efi_info "[DRY RUN] Bootloader update complete (no changes needed)"
++        fi
 +    else
 +        _efi_info "Bootloader update complete"
++        logger -p daemon.notice -t efi_bootloader_update \
++            "EFI bootloader updated successfully"
 +    fi
 +    return 0
 +}
@@ -1585,8 +1723,9 @@ index 000000000000..3efe34ccf353
 +if [ "${_efi_script_name}" = "efi_bootloader_update.sh" ]; then
 +    while [ $# -gt 0 ]; do
 +        case "$1" in
-+            --dry-run|-n) EFI_DRY_RUN=1  ;;
-+            --verbose|-v) EFI_VERBOSE=1  ;;
++            --dry-run|-n)     EFI_DRY_RUN=1       ;;
++            --confirm-update) EFI_CONFIRM_UPDATE=1 ;;
++            --verbose|-v)     EFI_VERBOSE=1        ;;
 +            --help|-h)
 +                cat <<EOF
 +Usage: ${_efi_script_name} [OPTIONS]
@@ -1595,15 +1734,23 @@ index 000000000000..3efe34ccf353
 +BIOS bootcode on freebsd-boot partition(s) for all disks participating in
 +the root filesystem.
 +
++When called with no options, the script runs in dry-run mode and reports
++what would be updated without making any changes.  Use --confirm-update to
++perform the actual write.
++
 +Options:
-+  -n, --dry-run   Show what would be done without making any changes
-+  -v, --verbose   Enable debug/verbose output
-+  -h, --help      Show this help message
++  -n, --dry-run        Evaluate and report without making changes (default)
++      --confirm-update Perform the bootloader update
++  -v, --verbose        Enable debug/verbose output
++  -h, --help           Show this help message
 +
 +Environment:
-+  EFI_LOADER_SRC      Source loader path (default: /boot/loader.efi)
-+  EFI_DRY_RUN         1 = dry-run mode
-+  EFI_VERBOSE         1 = verbose/debug mode
++  EFI_LOADER_SRC        Source loader path (default: /boot/loader.efi)
++  EFI_DRY_RUN           1 = dry-run mode (default when called directly)
++  EFI_CONFIRM_UPDATE    1 = perform write; equivalent to --confirm-update
++  EFI_VERBOSE           1 = verbose/debug mode
++  EFI_NVRAM_UPDATE      0 = skip NVRAM boot entry management
++  EFI_INSTALL_IA32      1 = fresh-install BOOTia32.efi when absent from ESP
 +EOF
 +                exit 0
 +                ;;
@@ -1615,31 +1762,143 @@ index 000000000000..3efe34ccf353
 +        shift
 +    done
 +
++    # Default to dry-run when called directly with no explicit mode flags.
++    # This ensures users see the notification modal before any writes occur.
++    # When called by freebsd-update, the mode is set explicitly via env vars
++    # based on the UpdateBootloader conf setting (dry-run/yes/no).
++    if [ "${EFI_CONFIRM_UPDATE}" != "1" ] && [ "${EFI_DRY_RUN}" != "1" ]; then
++        EFI_DRY_RUN=1
++    fi
++
++    # EFI_DRY_RUN takes precedence when both are set.
++    if [ "${EFI_DRY_RUN}" = "1" ] && [ "${EFI_CONFIRM_UPDATE}" = "1" ]; then
++        _efi_warn "EFI_DRY_RUN and EFI_CONFIRM_UPDATE both set; dry-run takes precedence"
++        EFI_CONFIRM_UPDATE=0
++    fi
++
 +    update_bootloaders
 +    exit $?
 +fi
 diff --git a/usr.sbin/freebsd-update/freebsd-update.8 b/usr.sbin/freebsd-update/freebsd-update.8
-index 0d50ac8822de..2cee17e42cca 100644
+index 024185198342..48080362abc6 100644
 --- a/usr.sbin/freebsd-update/freebsd-update.8
 +++ b/usr.sbin/freebsd-update/freebsd-update.8
-@@ -197,6 +197,34 @@ and the
+@@ -82,7 +82,8 @@ e.g.:
+ .Pp
+ In particular, the
+ .Fx
+-Security Team only builds updates for releases shipped in binary form by the
++Security Team only builds updates for releases shipped in binary form
++by the
+ .Fx
+ Release Engineering Team.
+ .Sh OPTIONS
+@@ -148,8 +149,8 @@ from
+ or similar using this flag, see:
+ .Nm Cm cron
+ .It Fl -currently-running Ar release
+-Do not detect the currently-running release; instead, assume that the system is
+-running the specified
++Do not detect the currently-running release; instead, assume that the
++system is running the specified
+ .Ar release .
+ This is most likely to be useful when upgrading jails.
+ .El
+@@ -159,26 +160,28 @@ The
+ can be any one of the following:
+ .Bl -tag -width "rollback"
+ .It Cm fetch
+-Based on the currently installed world and the configuration options set, fetch
+-all available binary updates.
++Based on the currently installed world and the configuration
++options set, fetch all available binary updates.
+ .It Cm cron
+-Sleep a random amount of time between 1 and 3600 seconds, then download updates
+-as if the
++Sleep a random amount of time between 1 and 3600 seconds,
++then download updates as if the
  .Cm fetch
- command wasn't passed as an earlier argument in the same
- invocation.
+ command was used.
+-If updates are downloaded, an email will be sent (to root or a different
+-address if specified via the
++If updates are downloaded, an email will be sent
++(to root or a different address if specified via the
+ .Fl t
+ option or in the configuration file).
+-As the name suggests, this command is designed for running from
++As the name suggests, this command is designed for running
++from
+ .Xr cron 8 ;
+-the random delay serves to minimize the probability that a large number of
+-machines will simultaneously attempt to fetch updates.
++the random delay serves to minimize the probability that
++a large number of machines will simultaneously attempt to
++fetch updates.
+ .It Cm upgrade
+ Fetch files necessary for upgrading to a new release.
+-Before using this command, make sure that you read the announcement and release
+-notes for the new release in case there are any special steps needed for
+-upgrading.
++Before using this command, make sure that you read the
++announcement and release notes for the new release in
++case there are any special steps needed for upgrading.
+ Note that this command may require up to 500 MB of space in
+ .Ar workdir
+ depending on which components of the
+@@ -189,15 +192,72 @@ Check if there are fetched updates ready to install.
+ Returns exit code 2 if there are no updates to install.
+ .It Cm install
+ Install the most recently fetched updates or upgrade.
+-Returns exit code 2 if there are no updates to install and the
++Returns exit code 2 if there are no updates to install
++and the
+ .Cm fetch
+-command wasn't passed as an earlier argument in the same invocation.
++command wasn't passed as an earlier argument in the same
++invocation.
 +.Pp
 +After installing updates,
 +.Nm
-+automatically updates the EFI bootloader on the EFI System Partition (ESP)
++evaluates whether the EFI bootloader on the EFI System Partition (ESP)
 +and the BIOS bootcode on
 +.Xr gpart 8
 +.Dq freebsd-boot
-+partitions.
++partitions need to be updated.
 +This ensures the firmware-facing bootloader is consistent with the newly
 +installed
 +.Pa /boot/loader.efi
 +and Lua scripts, preventing boot failures after major version upgrades.
 +EFI binaries that carry a Secure Boot signature are not overwritten;
 +a warning is emitted and the signed binary is left unchanged.
++.Pp
++The
++.Cm UpdateBootloader
++option in
++.Xr freebsd-update.conf 5
++controls bootloader update behavior and accepts three values:
++.Bl -tag -width "dry-run"
++.It Cm dry-run
++Evaluate what would be updated and report the result; no writes are made.
++If an update is recommended, a prominent notice is printed to the console
++and recorded via
++.Xr syslog 3
++at
++.Dv daemon.warn ,
++with instructions to apply the update before rebooting.
++This is the default.
++.It Cm yes
++Perform the bootloader update automatically.
++A
++.Dv daemon.notice
++syslog entry is written on success.
++.It Cm no
++Disable bootloader updates entirely.
++.El
++.Pp
++To apply a pending bootloader update immediately (as root):
++.Pp
++.Dl sh /usr/libexec/efi_bootloader_update.sh --confirm-update
++.Pp
 +To skip only NVRAM boot entry management while still updating ESP files,
 +set
 +.Cm UpdateBootloaderNVRAM no
@@ -1650,14 +1909,44 @@ index 0d50ac8822de..2cee17e42cca 100644
 +or when the firmware\(aqs
 +.Dv SetVariable
 +implementation is unreliable.
-+To disable bootloader updates entirely, set
-+.Cm UpdateBootloader no
-+in
-+.Xr freebsd-update.conf 5 .
  .It Cm rollback
  Uninstall the most recently installed updates.
  .It Cm IDS
-@@ -256,6 +284,14 @@ All files under
+-Compare the system against a "known good" index of the installed release.
++Compare the system against a "known good" index of the
++installed release.
+ .It Cm showconfig
+-Show configuration options after parsing conffile and command line options.
++Show configuration options after parsing conffile and command
++line options.
+ .El
+ .Sh TIPS
+ .Bl -bullet
+@@ -209,15 +269,17 @@ If your clock is set to local time, adding the line
+ to
+ .Pa /etc/crontab
+ will check for updates every night.
+-If your clock is set to UTC, please pick a random time other than 3AM, to avoid
+-overly imposing an uneven load on the server(s) hosting the updates.
++If your clock is set to UTC, please pick a random time
++other than 3AM, to avoid overly imposing an uneven load
++on the server(s) hosting the updates.
+ .It
+ In spite of its name,
+ .Nm
+-IDS should not be relied upon as an "Intrusion Detection System", since if the
+-system has been tampered with it cannot be trusted to operate correctly.
+-If you intend to use this command for intrusion-detection purposes, make sure
+-you boot from a secure disk (e.g., a CD).
++IDS should not be relied upon as an "Intrusion Detection
++System", since if the system has been tampered with
++it cannot be trusted to operate correctly.
++If you intend to use this command for intrusion-detection
++purposes, make sure you boot from a secure disk (e.g., a CD).
+ .El
+ .Sh ENVIRONMENT
+ .Bl -tag -width "PAGER"
+@@ -247,6 +309,27 @@ All files under
  .Pa /var/db/freebsd-update/
  may be deleted if an upgrade is not in progress and rollback will not be
  required.
@@ -1669,29 +1958,62 @@ index 0d50ac8822de..2cee17e42cca 100644
 +to update bootloaders on the ESP and
 +.Dq freebsd-boot
 +partitions.
++The script may also be invoked directly.
++With no arguments or
++.Fl -dry-run ,
++it evaluates what would be updated without making any changes.
++With
++.Fl -confirm-update ,
++it performs the update.
++The
++.Ev EFI_DRY_RUN
++and
++.Ev EFI_CONFIRM_UPDATE
++environment variables are equivalent to the respective flags and are
++suitable for scripted callers that cannot pass flags directly.
  .El
  .Sh SEE ALSO
  .Xr freebsd-version 1 ,
+@@ -255,13 +338,3 @@ required.
+ .Xr nextboot 8
+ .Sh AUTHORS
+ .An Colin Percival Aq Mt cperciva@FreeBSD.org
+-.Sh BUGS
+-In patch level situations – for example, 13.2-RELEASE-p1 up to
+-13.2-RELEASE-p2: if any previous modification to a file in
+-.Pa /etc/
+-will conflict with an available update, then
+-.Nm
+-will make no attempt to merge.
+-Instead:
+-.Nm
+-will print a list of affected locally-modified files.
 diff --git a/usr.sbin/freebsd-update/freebsd-update.conf b/usr.sbin/freebsd-update/freebsd-update.conf
-index 08cf512ce144..225032a7a9c9 100644
+index 08cf512ce144..d2fc59ca86ec 100644
 --- a/usr.sbin/freebsd-update/freebsd-update.conf
 +++ b/usr.sbin/freebsd-update/freebsd-update.conf
-@@ -76,3 +76,13 @@ MergeChanges /etc/ /boot/device.hints
+@@ -76,3 +76,19 @@ MergeChanges /etc/ /boot/device.hints
  
  # Create a new boot environment when installing patches
  # CreateBootEnv yes
 +
 +# Automatically update the EFI bootloader on the ESP and BIOS bootcode on
-+# freebsd-boot partitions when installing updates.  Disable only if you manage
-+# bootloaders manually or use a custom boot configuration.
-+# UpdateBootloader yes
++# freebsd-boot partitions when installing updates.
++#
++# dry-run  Evaluate and report what would be updated; no writes made.
++#          A prominent notice is printed if an update is recommended,
++#          with instructions to apply it before the next reboot.
++# yes      Perform the update automatically.
++# no       Disable bootloader updates entirely.
++#
++# UpdateBootloader dry-run
 +
 +# Set to no to skip NVRAM boot entry management while still updating ESP files.
 +# Use when NVRAM entries are managed externally (BMC, Ansible, iDRAC, etc.) or
 +# when the firmware's SetVariable implementation is unreliable.
 +# UpdateBootloaderNVRAM yes
 diff --git a/usr.sbin/freebsd-update/freebsd-update.sh b/usr.sbin/freebsd-update/freebsd-update.sh
-index 438e13a51154..c139b7159fa1 100644
+index 5d52eb285fe0..0e9ff3bfe8ed 100644
 --- a/usr.sbin/freebsd-update/freebsd-update.sh
 +++ b/usr.sbin/freebsd-update/freebsd-update.sh
 @@ -97,7 +97,8 @@ EOF
@@ -1704,7 +2026,7 @@ index 438e13a51154..c139b7159fa1 100644
  
  # Set all the configuration options to "".
  nullconfig () {
-@@ -439,6 +440,42 @@ config_CreateBootEnv () {
+@@ -439,6 +440,45 @@ config_CreateBootEnv () {
  		return 1
  	fi
  }
@@ -1716,6 +2038,9 @@ index 438e13a51154..c139b7159fa1 100644
 +			;;
 +		[Nn][Oo])
 +			UPDATEBOOTLOADER=no
++			;;
++		[Dd][Rr][Yy]-[Rr][Uu][Nn])
++			UPDATEBOOTLOADER=dry-run
 +			;;
 +		*)
 +			return 1
@@ -1747,22 +2072,372 @@ index 438e13a51154..c139b7159fa1 100644
  # Handle one line of configuration
  configline () {
  	if [ $# -eq 0 ]; then
-@@ -620,6 +657,8 @@ default_params () {
+@@ -512,14 +552,14 @@ parse_cmdline () {
+ 			if [ $# -eq 1 ]; then usage; fi; shift
+ 			config_KeyPrint $1 || usage
+ 			;;
+-		-r)
+-			if [ $# -eq 1 ]; then usage; fi; shift
+-			config_TargetRelease $1 || usage
+-			;;
+ 		-s)
+ 			if [ $# -eq 1 ]; then usage; fi; shift
+ 			config_ServerName $1 || usage
+ 			;;
++		-r)
++			if [ $# -eq 1 ]; then usage; fi; shift
++			config_TargetRelease $1 || usage
++			;;
+ 		-t)
+ 			if [ $# -eq 1 ]; then usage; fi; shift
+ 			config_MailTo $1 || usage
+@@ -620,6 +660,8 @@ default_params () {
  	config_BackupKernelDir /boot/kernel.old
  	config_BackupKernelSymbolFiles no
  	config_CreateBootEnv yes
-+	config_UpdateBootloader yes
++	config_UpdateBootloader dry-run
 +	config_UpdateBootloaderNVRAM yes
  
  	# Merge these defaults into the earlier-configured settings
  	mergeconfig
-@@ -3141,6 +3180,33 @@ install_setup_rollback () {
+@@ -776,7 +818,7 @@ fetch_check_params () {
+ 
+ 	if ! [ -z "${TARGETRELEASE}" ]; then
+ 		echo -n "`basename $0`: "
+-		echo -n "'-r' option is meaningless with 'fetch' command.  "
++		echo -n "-r option is meaningless with 'fetch' command.  "
+ 		echo "(Did you mean 'upgrade' instead?)"
+ 		exit 1
+ 	fi
+@@ -784,8 +826,8 @@ fetch_check_params () {
+ 	# Check that we have updates ready to install
+ 	if [ -f ${BDHASH}-install/kerneldone -a $FORCEFETCH -eq 0 ]; then
+ 		echo "You have a partially completed upgrade pending"
+-		echo "Run '`basename $0` [options] install' first."
+-		echo "Run '`basename $0` [options] fetch -F' to proceed anyway."
++		echo "Run '$0 install' first."
++		echo "Run '$0 fetch -F' to proceed anyway."
+ 		exit 1
+ 	fi
+ }
+@@ -798,7 +840,7 @@ upgrade_check_params () {
+ 	NKERNCONF=${KERNCONF}
+ 
+ 	# We need TARGETRELEASE set
+-	_TARGETRELEASE_z="Release target must be specified via '-r' option."
++	_TARGETRELEASE_z="Release target must be specified via -r option."
+ 	if [ -z "${TARGETRELEASE}" ]; then
+ 		echo -n "`basename $0`: "
+ 		echo "${_TARGETRELEASE_z}"
+@@ -863,7 +905,7 @@ install_check_params () {
+ 	if ! [ -L ${BDHASH}-install ]; then
+ 		echo "No updates are available to install."
+ 		if [ $ISFETCHED -eq 0 ]; then
+-			echo "Run '`basename $0` [options] fetch' first."
++			echo "Run '$0 fetch' first."
+ 			exit 2
+ 		fi
+ 		exit 0
+@@ -871,7 +913,7 @@ install_check_params () {
+ 	if ! [ -f ${BDHASH}-install/INDEX-OLD ] ||
+ 	    ! [ -f ${BDHASH}-install/INDEX-NEW ]; then
+ 		echo "Update manifest is corrupt -- this should never happen."
+-		echo "Re-run '`basename $0` [options] fetch'."
++		echo "Re-run '$0 fetch'."
+ 		exit 1
+ 	fi
+ 
+@@ -973,7 +1015,7 @@ IDS_check_params () {
+ 
+ 	_SERVERNAME_z=\
+ "SERVERNAME must be given via command line or configuration file."
+-	_KEYPRINT_z="Key must be given via '-k' option or configuration file."
++	_KEYPRINT_z="Key must be given via -k option or configuration file."
+ 	_KEYPRINT_bad="Invalid key fingerprint: "
+ 	_WORKDIR_bad="Directory does not exist or is not writable: "
+ 
+@@ -1046,31 +1088,16 @@ IDS_check_params () {
+ 	fetch_setup_verboselevel
+ }
+ 
+-# Return 0 if the system is managed using pkgbase, 1 otherwise.
+-check_pkgbase()
+-{
+-	# Packaged base requires that pkg is bootstrapped.
+-	if ! pkg -r ${BASEDIR} -N >/dev/null 2>/dev/null; then
+-		return 1
+-	fi
+-	# uname(1) is used by pkg to determine ABI, so it should exist.
+-	# If it comes from a package then this system uses packaged base.
+-	if ! pkg -r ${BASEDIR} which /usr/bin/uname >/dev/null; then
+-		return 1
+-	fi
+-	return 0
+-}
+-
+ #### Core functionality -- the actual work gets done here
+ 
+ # Use an SRV query to pick a server.  If the SRV query doesn't provide
+ # a useful answer, use the server name specified by the user.
+ # Put another way... look up _http._tcp.${SERVERNAME} and pick a server
+ # from that; or if no servers are returned, use ${SERVERNAME}.
+-# This allows a user to specify "update.FreeBSD.org" (in which case
+-# freebsd-update will select one of the mirrors) or "update1.freebsd.org"
+-# (in which case freebsd-update will use that particular server, since
+-# there won't be an SRV entry for that name).
++# This allows a user to specify "portsnap.freebsd.org" (in which case
++# portsnap will select one of the mirrors) or "portsnap5.tld.freebsd.org"
++# (in which case portsnap will use that particular server, since there
++# won't be an SRV entry for that name).
+ #
+ # We ignore the Port field, since we are always going to use port 80.
+ 
+@@ -1349,7 +1376,7 @@ fetch_metadata_index () {
+ fetch_metadata_bogus () {
+ 	echo
+ 	echo "The update metadata$1 is correctly signed, but"
+-	echo "failed an integrity check ($2)."
++	echo "failed an integrity check."
+ 	echo "Cowardly refusing to proceed any further."
+ 	return 1
+ }
+@@ -1360,7 +1387,7 @@ fetch_metadata_index_merge () {
+ 	for METAFILE in $@; do
+ 		if [ `grep -E "^${METAFILE}\|" ${TINDEXHASH} | wc -l`	\
+ 		    -ne 1 ]; then
+-			fetch_metadata_bogus " index" "${METAFILE} count not 1"
++			fetch_metadata_bogus " index"
+ 			return 1
+ 		fi
+ 
+@@ -1383,7 +1410,7 @@ fetch_metadata_index_merge () {
+ # specifically grepped out of ${TINDEXHASH}.
+ fetch_metadata_index_sanity () {
+ 	if grep -qvE '^[0-9A-Z.-]+\|[0-9a-f]{64}$' tINDEX.new; then
+-		fetch_metadata_bogus " index" "unexpected entry in tINDEX.new"
++		fetch_metadata_bogus " index"
+ 		return 1
+ 	fi
+ }
+@@ -1400,7 +1427,7 @@ fetch_metadata_sanity () {
+ 	# Check that the first four fields make sense.
+ 	if gunzip -c < files/$1.gz |
+ 	    grep -qvE "^[a-z]+\|[0-9a-z-]+\|${P}+\|[fdL-]\|"; then
+-		fetch_metadata_bogus "" "invalid initial fields"
++		fetch_metadata_bogus ""
+ 		return 1
+ 	fi
+ 
+@@ -1411,28 +1438,28 @@ fetch_metadata_sanity () {
+ 	# Sanity check entries with type 'f'
+ 	if grep -E '^f' sanitycheck.tmp |
+ 	    grep -qvE "^f\|${M}\|${H}\|${P}*\$"; then
+-		fetch_metadata_bogus "" "invalid type f entry"
++		fetch_metadata_bogus ""
+ 		return 1
+ 	fi
+ 
+ 	# Sanity check entries with type 'd'
+ 	if grep -E '^d' sanitycheck.tmp |
+ 	    grep -qvE "^d\|${M}\|\|\$"; then
+-		fetch_metadata_bogus "" "invalid type d entry"
++		fetch_metadata_bogus ""
+ 		return 1
+ 	fi
+ 
+ 	# Sanity check entries with type 'L'
+ 	if grep -E '^L' sanitycheck.tmp |
+ 	    grep -qvE "^L\|${M}\|${P}*\|\$"; then
+-		fetch_metadata_bogus "" "invalid type L entry"
++		fetch_metadata_bogus ""
+ 		return 1
+ 	fi
+ 
+ 	# Sanity check entries with type '-'
+ 	if grep -E '^-' sanitycheck.tmp |
+ 	    grep -qvE "^-\|\|\|\|\|\|"; then
+-		fetch_metadata_bogus "" "invalid type - entry"
++		fetch_metadata_bogus ""
+ 		return 1
+ 	fi
+ 
+@@ -2341,7 +2368,7 @@ upgrade_guess_components () {
+ WARNING: This system is running a "${KCOMP}" kernel, which is not a
+ kernel configuration distributed as part of FreeBSD ${RELNUM}.
+ This kernel will not be updated: you MUST update the kernel manually
+-before running '`basename $0` [options] install'.
++before running "$0 install".
+ 			EOF
+ 		fi
+ 
+@@ -2523,7 +2550,7 @@ upgrade_merge () {
+ 
+ 			# Some files need special treatment.
+ 			case ${F} in
+-			/etc/spwd.db | /etc/pwd.db | /etc/login.conf.db | /etc/ssl/cert.pem)
++			/etc/spwd.db | /etc/pwd.db | /etc/login.conf.db)
+ 				# Don't merge these -- we're rebuild them
+ 				# after updates are installed.
+ 				cp merge/old/${F} merge/new/${F}
+@@ -2559,11 +2586,7 @@ Press Enter to edit this file in ${EDITOR} and resolve the conflicts
+ manually...
+ 			EOF
+ 			while true; do
+-				read response </dev/tty
+-				if expr "${response}" : '[Aa][Cc][Cc][Ee][Pp][Tt]' > /dev/null; then
+-					echo
+-					break
+-				fi
++				read dummy </dev/tty
+ 				${EDITOR} `pwd`/merge/new/${F} < /dev/tty
+ 
+ 				if ! grep -qE '^(<<<<<<<|=======|>>>>>>>)([[:space:]].*)?$' $(pwd)/merge/new/${F} ; then
+@@ -2574,8 +2597,7 @@ manually...
+ Merge conflict markers remain in: ${F}
+ These must be resolved for the system to be functional.
+ 
+-Press Enter to return to editing this file, or type "ACCEPT" to carry on with
+-these lines remaining in the file.
++Press Enter to return to editing this file.
+ 				EOF
+ 			done
+ 		done < failed.merges
+@@ -2785,7 +2807,7 @@ upgrade_run () {
+ 
+ 	# Remind the user that they need to run "freebsd-update install"
+ 	# to install the downloaded bits, in case they didn't RTFM.
+-	echo "To install the downloaded upgrades, run '`basename $0` [options] install'."
++	echo "To install the downloaded upgrades, run \"$0 install\"."
+ }
+ 
+ # Make sure that all the file hashes mentioned in $@ have corresponding
+@@ -2803,7 +2825,7 @@ install_verify () {
+ 		if ! [ -f files/${HASH}.gz ]; then
+ 			echo -n "Update files missing -- "
+ 			echo "this should never happen."
+-			echo "Re-run '`basename $0` [options] fetch'."
++			echo "Re-run '$0 fetch'."
+ 			return 1
+ 		fi
+ 	done < filelist
+@@ -2910,19 +2932,10 @@ backup_kernel () {
+ 	(cd ${BASEDIR}/${KERNELDIR} && find . -type f $FINDFILTER -exec \
+ 	    cp -pl '{}' ${BASEDIR}/${BACKUPKERNELDIR}/'{}' \;)
+ 
+-	# Re-enable pathname expansion.
++	# Re-enable patchname expansion.
+ 	set +f
+ }
+ 
+-# Check for and remove an existing directory that conflicts with the file or
+-# symlink that we are going to install.
+-dir_conflict () {
+-	if [ -d "$1" ]; then
+-		echo "Removing conflicting directory $1"
+-		rm -rf -- "$1"
+-	fi
+-}
+-
+ # Install new files
+ install_from_index () {
+ 	# First pass: Do everything apart from setting file flags.  We
+@@ -2943,11 +2956,10 @@ install_from_index () {
+ 			    -m ${PERM} ${BASEDIR}/${FPATH}
+ 			;;
+ 		f)
+-			dir_conflict "${BASEDIR}/${FPATH}"
+ 			if [ -z "${LINK}" ]; then
+ 				# Create a file, without setting flags.
+ 				gunzip < files/${HASH}.gz > ${HASH}
+-				install -o ${OWNER} -g ${GROUP}		\
++				install -S -o ${OWNER} -g ${GROUP}	\
+ 				    -m ${PERM} ${HASH} ${BASEDIR}/${FPATH}
+ 				rm ${HASH}
+ 			else
+@@ -2956,7 +2968,6 @@ install_from_index () {
+ 			fi
+ 			;;
+ 		L)
+-			dir_conflict "${BASEDIR}/${FPATH}"
+ 			# Create a symlink
+ 			ln -sfh ${HASH} ${BASEDIR}/${FPATH}
+ 			;;
+@@ -2993,14 +3004,10 @@ install_delete () {
+ 			rmdir ${BASEDIR}/${FPATH}
+ 			;;
+ 		f)
+-			if [ -f "${BASEDIR}/${FPATH}" ]; then
+-				rm "${BASEDIR}/${FPATH}"
+-			fi
++			rm ${BASEDIR}/${FPATH}
+ 			;;
+ 		L)
+-			if [ -L "${BASEDIR}/${FPATH}" ]; then
+-				rm "${BASEDIR}/${FPATH}"
+-			fi
++			rm ${BASEDIR}/${FPATH}
+ 			;;
+ 		esac
+ 	done < killfiles
+@@ -3039,7 +3046,7 @@ install_files () {
+ 			cat <<-EOF
+ 
+ Kernel updates have been installed.  Please reboot and run
+-'`basename $0` [options] install' again to finish installing updates.
++"$0 install" again to finish installing updates.
+ 			EOF
+ 			exit 0
+ 		fi
+@@ -3058,28 +3065,10 @@ Kernel updates have been installed.  Please reboot and run
+ 		    grep -E '^/libexec/ld-elf[^|]*\.so\.[0-9]+\|' > INDEX-NEW
+ 		install_from_index INDEX-NEW || return 1
+ 
+-		# Next, in order, libsys, libc, and libthr.
+-		grep -vE '^/boot/' $1/INDEX-NEW |
+-		    grep -vE '^[^|]+\|d\|' |
+-		    grep -vE '^/libexec/ld-elf[^|]*\.so\.[0-9]+\|' |
+-		    grep -E '^[^|]*/lib/libsys\.so\.[0-9]+\|' > INDEX-NEW
+-		install_from_index INDEX-NEW || return 1
+-		grep -vE '^/boot/' $1/INDEX-NEW |
+-		    grep -vE '^[^|]+\|d\|' |
+-		    grep -vE '^/libexec/ld-elf[^|]*\.so\.[0-9]+\|' |
+-		    grep -E '^[^|]*/lib/libc\.so\.[0-9]+\|' > INDEX-NEW
+-		install_from_index INDEX-NEW || return 1
+-		grep -vE '^/boot/' $1/INDEX-NEW |
+-		    grep -vE '^[^|]+\|d\|' |
+-		    grep -vE '^/libexec/ld-elf[^|]*\.so\.[0-9]+\|' |
+-		    grep -E '^[^|]*/lib/libthr\.so\.[0-9]+\|' > INDEX-NEW
+-		install_from_index INDEX-NEW || return 1
+-
+-		# Install the rest of the shared libraries next
++		# Install new shared libraries next
+ 		grep -vE '^/boot/' $1/INDEX-NEW |
+ 		    grep -vE '^[^|]+\|d\|' |
+ 		    grep -vE '^/libexec/ld-elf[^|]*\.so\.[0-9]+\|' |
+-		    grep -vE '^[^|]*/lib/(libsys|libc|libthr)\.so\.[0-9]+\|' |
+ 		    grep -E '^[^|]*/lib/[^|]*\.so\.[0-9]+\|' > INDEX-NEW
+ 		install_from_index INDEX-NEW || return 1
+ 
+@@ -3143,9 +3132,9 @@ Kernel updates have been installed.  Please reboot and run
+ 			cat <<-EOF
+ 
+ Completing this upgrade requires removing old shared object files.
+-Please upgrade or rebuild all installed 3rd party software (e.g.,
+-programs installed with pkg or from the ports tree) and then run
+-'`basename $0` [options] install' again to finish installing updates.
++Please rebuild all installed 3rd party software (e.g., programs
++installed from the ports tree) and then run "$0 install"
++again to finish installing updates.
+ 			EOF
+ 			rm newfiles
+ 			exit 0
+@@ -3194,6 +3183,44 @@ install_setup_rollback () {
  }
  
  # Actually install updates
 +# Update EFI and BIOS bootloaders after the new world/kernel is installed.
 +# Sources /usr/libexec/efi_bootloader_update.sh to allow independent testing.
-+# Controlled by UpdateBootloader in freebsd-update.conf (default: yes).
++# Controlled by UpdateBootloader in freebsd-update.conf (default: dry-run).
 +update_bootloaders_after_install () {
 +	if [ "${UPDATEBOOTLOADER}" = "no" ]; then
 +		return 0
@@ -1771,6 +2446,17 @@ index 438e13a51154..c139b7159fa1 100644
 +	if [ "${UPDATEBOOTLOADERNVRAM}" = "no" ]; then
 +		EFI_NVRAM_UPDATE=0
 +		export EFI_NVRAM_UPDATE
++	fi
++
++	# Translate conf value to env var for efi_bootloader_update.sh.
++	# dry-run: evaluate only; yes: perform write.
++	if [ "${UPDATEBOOTLOADER}" = "dry-run" ]; then
++		EFI_DRY_RUN=1
++		export EFI_DRY_RUN
++	else
++		# UpdateBootloader yes
++		EFI_CONFIRM_UPDATE=1
++		export EFI_CONFIRM_UPDATE
 +	fi
 +
 +	_efi_lib="${BASEDIR}/usr/libexec/efi_bootloader_update.sh"
@@ -1784,13 +2470,13 @@ index 438e13a51154..c139b7159fa1 100644
 +	# shellcheck source=/usr/libexec/efi_bootloader_update.sh
 +	. "${_efi_lib}"
 +	update_bootloaders || true   # warnings already printed; never block install
-+	unset _efi_lib
++	unset _efi_lib EFI_DRY_RUN EFI_CONFIRM_UPDATE
 +}
 +
  install_run () {
  	echo -n "Installing updates..."
  
-@@ -3159,6 +3225,10 @@ install_run () {
+@@ -3212,6 +3239,10 @@ install_run () {
  	install_setup_rollback
  
  	echo " done."
@@ -1801,3 +2487,52 @@ index 438e13a51154..c139b7159fa1 100644
  }
  
  # Rearrange bits to allow the previous set of updates to be rolled back next.
+@@ -3229,11 +3260,6 @@ rollback_setup_rollback () {
+ 
+ # Install old files, delete new files, and update linker.hints
+ rollback_files () {
+-	# Create directories first.  They may be needed by files we will
+-	# install in subsequent steps (PR273950).
+-	awk -F \| '{if ($2 == "d") print }' $1/INDEX-OLD > INDEX-OLD
+-	install_from_index INDEX-OLD || return 1
+-
+ 	# Install old shared library files which don't have the same path as
+ 	# a new shared library file.
+ 	grep -vE '^/boot/' $1/INDEX-NEW |
+@@ -3490,7 +3516,6 @@ cmd_cron () {
+ 	    [ ${VERBOSELEVEL} = "debug" ]; then
+ 		mail -s "`hostname` security updates" ${MAILTO} < ${TMPFILE}
+ 	fi
+-	ISFETCHED=1
+ 
+ 	rm ${TMPFILE}
+ }
+@@ -3525,7 +3550,7 @@ cmd_updatesready () {
+ 	fi
+ 
+ 	echo "There are updates available to install."
+-	echo "Run '`basename $0` [options] install' to proceed."
++	echo "Run '$0 install' to proceed."
+ }
+ 
+ # Install downloaded updates.
+@@ -3574,18 +3599,7 @@ export LC_ALL=C
+ # Clear environment variables that may affect operation of tools that we use.
+ unset GREP_OPTIONS
+ 
+-# Parse command line options and the configuration file.
+-get_params "$@"
+-
+-# Disallow use with packaged base.
+-if check_pkgbase; then
+-	cat <<EOF
+-freebsd-update is incompatible with the use of packaged base.  Please see
+-https://wiki.freebsd.org/PkgBase for more information.
+-EOF
+-	exit 1
+-fi
+-
++get_params $@
+ for COMMAND in ${COMMANDS}; do
+ 	cmd_${COMMAND}
+ done
