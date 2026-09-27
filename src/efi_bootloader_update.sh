@@ -17,6 +17,7 @@ _EFI_BOOTLOADER_UPDATE_SH=1
 
 : "${EFI_LOADER_SRC:=/boot/loader.efi}"
 : "${EFI_DRY_RUN:=0}"
+: "${EFI_CONFIRM_UPDATE:=0}"  # Set to 1 to perform writes; equivalent to --confirm-update
 : "${EFI_VERBOSE:=0}"
 : "${EFI_NVRAM_UPDATE:=1}"     # Set to 0 to skip NVRAM boot entry management
 : "${EFI_BIOS_PMBR:=/boot/pmbr}"
@@ -67,6 +68,69 @@ _efi_info() { _efi_log "INFO:  $*"; }
 _efi_warn() { _efi_log "WARN:  $*" >&2; }
 _efi_err()  { _efi_log "ERROR: $*" >&2; }
 _efi_verb() { [ "${EFI_VERBOSE}" = "1" ] && _efi_log "DEBUG: $*" || true; }
+
+# Count of pending writes detected during a dry-run pass.  Reset to 0 at the
+# start of each update_bootloaders() call; incremented by efi_safe_copy when
+# EFI_DRY_RUN=1 and a write would have occurred.  Drives the modal notification.
+_efi_dry_run_pending=0
+
+# Per-ESP count of pending writes; reset before each ESP iteration in
+# update_bootloaders().  Used to decide whether to collect detail lines.
+_efi_dry_run_pending_esp=0
+
+# Accumulated per-ESP detail lines for the dry-run modal.  Each block is
+# collected after efi_update_esp returns.  Multi-line; uses literal embedded
+# newlines for POSIX sh portability.
+_efi_dry_run_details=""
+
+# Fingerprint evidence from the most recent successful efi_is_freebsd_loader()
+# call.  Set to "bootprog_info match" or "N/M heuristic match".  Reset before
+# each ESP iteration in update_bootloaders().
+_efi_last_fingerprint=""
+
+# _efi_modal_line LINE
+# Prints one line of modal body content to stdout, prefixed with "*** ".
+_efi_modal_line() { printf '*** %s\n' "$*"; }
+
+# _efi_modal SYSLOG_SUMMARY LINE [LINE ...]
+#
+# Emits a prominent bordered notification block to stdout and writes a
+# single-line summary to syslog at daemon.warn priority.
+#
+# stdout is used (not stderr) so the block is visible in any terminal session
+# and can be captured by automated tooling that captures stdout.  syslog
+# provides persistence for unattended/cron invocations where console output
+# is not reviewed.
+_efi_modal() {
+    _modal_summary="$1"; shift
+    printf '\n'
+    while [ $# -gt 0 ]; do
+        _efi_modal_line "$1"
+        shift
+    done
+    printf '\n'
+    logger -p daemon.warn -t efi_bootloader_update "$_modal_summary"
+}
+
+# _efi_mtime FILE
+# Prints the modification timestamp of FILE as "YYYY-MM-DD HH:MM UTC".
+# Returns empty on error or absent file.  Uses FreeBSD stat(1) syntax;
+# silently produces no output on Linux development machines.
+_efi_mtime() {
+    stat -f "%Sm" -t "%Y-%m-%d %H:%M %Z" "$1" 2>/dev/null || true
+}
+
+# _efi_detail_append LINE
+# Appends LINE to _efi_dry_run_details using a literal embedded newline
+# for POSIX sh portability (no printf %b, no $'...').
+_efi_detail_append() {
+    if [ -z "$_efi_dry_run_details" ]; then
+        _efi_dry_run_details="$1"
+    else
+        _efi_dry_run_details="${_efi_dry_run_details}
+$1"
+    fi
+}
 
 # ============================================================
 # ARCHITECTURE → EFI BINARY MAPPING
@@ -915,6 +979,7 @@ efi_is_freebsd_loader() {
     # Primary: match the bootprog_info pattern.
     if strings "$file" 2>/dev/null | grep -qE 'FreeBSD/[^ ]+ EFI[ ,]'; then
         _efi_verb "Fingerprint '${file}': bootprog_info match"
+        _efi_last_fingerprint="bootprog_info match"
         return 0
     fi
 
@@ -926,7 +991,11 @@ efi_is_freebsd_loader() {
     done
 
     _efi_verb "Fingerprint '${file}': ${matches}/${_EFI_FINGERPRINT_THRESHOLD} heuristic match(es)"
-    [ "$matches" -ge "${_EFI_FINGERPRINT_THRESHOLD}" ]
+    if [ "$matches" -ge "${_EFI_FINGERPRINT_THRESHOLD}" ]; then
+        _efi_last_fingerprint="${matches}/${_EFI_FINGERPRINT_THRESHOLD} heuristic match"
+        return 0
+    fi
+    return 1
 }
 
 # Returns 0 if the given EFI binary carries an Authenticode / Secure Boot
@@ -1014,15 +1083,19 @@ efi_safe_copy() {
     # current) or dry-run.  Callers use this to count actual writes.
     _efi_copy_wrote=0
 
-    if [ "${EFI_DRY_RUN}" = "1" ]; then
-        _efi_info "[DRY RUN] Would update: ${dst}"
+    # Skip the copy if the destination already matches the source.
+    # Checked before the dry-run gate so dry-run reports accurately: a file
+    # that is already current is silently skipped in both modes, and the
+    # dry-run modal only fires when writes would actually be needed.
+    if [ -f "$dst" ] && cmp -s "$src" "$dst" 2>/dev/null; then
+        _efi_verb "Already up to date: ${dst}"
         return 0
     fi
 
-    # Skip the copy if the destination already matches the source.
-    # Avoids unnecessary FAT32 writes on repeated freebsd-update install runs.
-    if [ -f "$dst" ] && cmp -s "$src" "$dst" 2>/dev/null; then
-        _efi_verb "Already up to date: ${dst}"
+    if [ "${EFI_DRY_RUN}" = "1" ]; then
+        _efi_info "[DRY RUN] Would update: ${dst}"
+        _efi_dry_run_pending=$((_efi_dry_run_pending + 1))
+        _efi_dry_run_pending_esp=$((_efi_dry_run_pending_esp + 1))
         return 0
     fi
 
@@ -1465,6 +1538,10 @@ efi_update_bios_bootcode() {
 # Returns 0 if all updates succeeded, 1 if any failed.
 update_bootloaders() {
     local total_errors=0
+    _efi_dry_run_pending=0
+    _efi_dry_run_pending_esp=0
+    _efi_dry_run_details=""
+    _efi_last_fingerprint=""
 
     # ── Prerequisites ──────────────────────────────────────────────────────────
     local rc
@@ -1517,8 +1594,36 @@ update_bootloaders() {
                     continue
                 fi
 
+                _efi_dry_run_pending_esp=0
+                _efi_last_fingerprint=""
+
                 efi_update_esp "$esp_mp" "$fallback_binary" "$esp_disk" "$esp_pidx" "$esp_scheme" || \
                     total_errors=$((total_errors + 1))
+
+                # Collect per-ESP detail lines for the dry-run modal.
+                if [ "${EFI_DRY_RUN}" = "1" ] && \
+                   [ "${_efi_dry_run_pending_esp}" -gt 0 ]; then
+                    local _esp_dev _inst_abs _inst_rel _inst_mt _avail_mt _fp
+                    case "$esp_scheme" in
+                        MBR) _esp_dev="/dev/${esp_disk}s${esp_pidx}" ;;
+                        *)   _esp_dev="/dev/${esp_disk}p${esp_pidx}" ;;
+                    esac
+                    _inst_abs="${esp_mp}/EFI/FreeBSD/loader.efi"
+                    _inst_rel="EFI/FreeBSD/loader.efi"
+                    _inst_mt=$(_efi_mtime "$_inst_abs")
+                    _avail_mt=$(_efi_mtime "${EFI_LOADER_SRC}")
+                    _fp="${_efi_last_fingerprint:-ESP topology (gpart)}"
+                    [ -n "${_efi_dry_run_details}" ] && \
+                        _efi_detail_append ""
+                    _efi_detail_append "ESP:       ${_esp_dev}  (${esp_mp})"
+                    _efi_detail_append "Installed: ${_inst_rel}"
+                    [ -n "${_inst_mt}" ] && \
+                        _efi_detail_append "           ${_inst_mt}"
+                    _efi_detail_append "Available: ${EFI_LOADER_SRC}"
+                    [ -n "${_avail_mt}" ] && \
+                        _efi_detail_append "           ${_avail_mt}"
+                    _efi_detail_append "FreeBSD:   fingerprint confirmed (${_fp})"
+                fi
 
                 efi_unmount_esp
             done <<_ESPS_
@@ -1549,9 +1654,42 @@ _BIOS_
     fi
 
     if [ "${EFI_DRY_RUN}" = "1" ]; then
-        _efi_info "[DRY RUN] Bootloader update complete (no changes made)"
+        if [ "${_efi_dry_run_pending}" -gt 0 ]; then
+            # Emit modal to stdout + syslog.  Detail lines (_efi_dry_run_details)
+            # are rendered inline because they contain newlines and cannot be
+            # passed as individual arguments to _efi_modal().
+            logger -p daemon.warn -t efi_bootloader_update \
+                "EFI bootloader update recommended — apply before rebooting (dry-run, no changes made)"
+            printf '\n'
+            _efi_modal_line "============================================================"
+            _efi_modal_line "NOTICE: EFI bootloader update recommended"
+            _efi_modal_line "============================================================"
+            if [ -n "${_efi_dry_run_details}" ]; then
+                _efi_modal_line ""
+                printf '%s\n' "${_efi_dry_run_details}" | while IFS= read -r _dl; do
+                    _efi_modal_line "${_dl}"
+                done
+            fi
+            _efi_modal_line "------------------------------------------------------------"
+            _efi_modal_line "WARNING: No changes were made (dry-run mode)."
+            _efi_modal_line "Update the bootloader BEFORE rebooting into the new kernel."
+            _efi_modal_line "Failure to do so may result in a boot failure."
+            _efi_modal_line "------------------------------------------------------------"
+            _efi_modal_line ""
+            _efi_modal_line "To apply now (as root):"
+            _efi_modal_line "  sh /usr/libexec/efi_bootloader_update.sh --confirm-update"
+            _efi_modal_line ""
+            _efi_modal_line "To apply automatically on future upgrades:"
+            _efi_modal_line "  Set  UpdateBootloader yes  in /etc/freebsd-update.conf"
+            _efi_modal_line "============================================================"
+            printf '\n'
+        else
+            _efi_info "[DRY RUN] Bootloader update complete (no changes needed)"
+        fi
     else
         _efi_info "Bootloader update complete"
+        logger -p daemon.notice -t efi_bootloader_update \
+            "EFI bootloader updated successfully"
     fi
     return 0
 }
@@ -1565,8 +1703,9 @@ _efi_script_name="${0##*/}"
 if [ "${_efi_script_name}" = "efi_bootloader_update.sh" ]; then
     while [ $# -gt 0 ]; do
         case "$1" in
-            --dry-run|-n) EFI_DRY_RUN=1  ;;
-            --verbose|-v) EFI_VERBOSE=1  ;;
+            --dry-run|-n)     EFI_DRY_RUN=1       ;;
+            --confirm-update) EFI_CONFIRM_UPDATE=1 ;;
+            --verbose|-v)     EFI_VERBOSE=1        ;;
             --help|-h)
                 cat <<EOF
 Usage: ${_efi_script_name} [OPTIONS]
@@ -1575,15 +1714,23 @@ Updates the FreeBSD EFI bootloader on the EFI System Partition(s) and the
 BIOS bootcode on freebsd-boot partition(s) for all disks participating in
 the root filesystem.
 
+When called with no options, the script runs in dry-run mode and reports
+what would be updated without making any changes.  Use --confirm-update to
+perform the actual write.
+
 Options:
-  -n, --dry-run   Show what would be done without making any changes
-  -v, --verbose   Enable debug/verbose output
-  -h, --help      Show this help message
+  -n, --dry-run        Evaluate and report without making changes (default)
+      --confirm-update Perform the bootloader update
+  -v, --verbose        Enable debug/verbose output
+  -h, --help           Show this help message
 
 Environment:
-  EFI_LOADER_SRC      Source loader path (default: /boot/loader.efi)
-  EFI_DRY_RUN         1 = dry-run mode
-  EFI_VERBOSE         1 = verbose/debug mode
+  EFI_LOADER_SRC        Source loader path (default: /boot/loader.efi)
+  EFI_DRY_RUN           1 = dry-run mode (default when called directly)
+  EFI_CONFIRM_UPDATE    1 = perform write; equivalent to --confirm-update
+  EFI_VERBOSE           1 = verbose/debug mode
+  EFI_NVRAM_UPDATE      0 = skip NVRAM boot entry management
+  EFI_INSTALL_IA32      1 = fresh-install BOOTia32.efi when absent from ESP
 EOF
                 exit 0
                 ;;
@@ -1594,6 +1741,20 @@ EOF
         esac
         shift
     done
+
+    # Default to dry-run when called directly with no explicit mode flags.
+    # This ensures users see the notification modal before any writes occur.
+    # When called by freebsd-update, the mode is set explicitly via env vars
+    # based on the UpdateBootloader conf setting (dry-run/yes/no).
+    if [ "${EFI_CONFIRM_UPDATE}" != "1" ] && [ "${EFI_DRY_RUN}" != "1" ]; then
+        EFI_DRY_RUN=1
+    fi
+
+    # EFI_DRY_RUN takes precedence when both are set.
+    if [ "${EFI_DRY_RUN}" = "1" ] && [ "${EFI_CONFIRM_UPDATE}" = "1" ]; then
+        _efi_warn "EFI_DRY_RUN and EFI_CONFIRM_UPDATE both set; dry-run takes precedence"
+        EFI_CONFIRM_UPDATE=0
+    fi
 
     update_bootloaders
     exit $?

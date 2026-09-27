@@ -2,7 +2,7 @@
 
 This repository contains a patch for `freebsd-update` that automatically updates the EFI bootloader on the ESP (EFI System Partition) during `freebsd-update install`. Without this fix, upgrading FreeBSD across major versions can silently leave a stale bootloader on the ESP — one that cannot boot the newly installed system.
 
-The patch is developed here ahead of submission to the FreeBSD project via Phabricator. It has been tested on real FreeBSD hardware across multiple versions with a 335-test suite covering unit, integration, and error conditions across a broad range of configurations.
+The patch is developed here ahead of submission to the FreeBSD project via Phabricator. It has been tested on real FreeBSD hardware across multiple versions with a 371-test suite covering unit, integration, and error conditions across a broad range of configurations.
 
 **Addresses:** [FreeBSD bug 279829](https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=279829)
 **Upstream status:** Closed "Not a bug" — but the underlying hazard is real and ongoing
@@ -13,14 +13,14 @@ The patch is developed here ahead of submission to the FreeBSD project via Phabr
 
 | | |
 |---|---|
-| Test suite | 335 / 335 passing |
+| Test suite | 371 / 371 passing |
 | Live run | ✓ Complete — FreeBSD 14.0-RELEASE-p11, amd64, UEFI, ZFS, NVMe |
-| Phabricator submission | ✓ [D58990](https://reviews.freebsd.org/D58990) — revision-7 uploaded (D58990?id=187491) |
+| Phabricator submission | ✓ [D58990](https://reviews.freebsd.org/D58990) — revision-8 uploaded (D58990?id=187785) |
 | Backport targets | `main` (15-CURRENT), `stable/14`, `stable/13` |
 
 ### Test Suite Run History
 
-335/335 tests passing. Validated across:
+371/371 tests passing. Validated across:
 - **Architectures:** amd64, aarch64
 - **FreeBSD versions:** 13.5, 14.0, 14.3, 14.4, 15.1 (RELEASE and CURRENT)
 - **Root filesystems:** ZFS, UFS
@@ -205,11 +205,11 @@ freebsd-patch-for-bug279829/
 ### Running Standalone on FreeBSD
 
 ```sh
-# Dry run — shows what would be done without making changes
+# Dry run — evaluates what would be updated; no writes made (default when no flag given)
 sh src/efi_bootloader_update.sh --dry-run --verbose
 
-# Live run (requires root)
-sudo sh src/efi_bootloader_update.sh --verbose
+# Apply update (requires root) — explicit opt-in required
+sudo sh src/efi_bootloader_update.sh --confirm-update --verbose
 ```
 
 ### Running the Test Suite
@@ -247,24 +247,60 @@ The hook runs **after the new world is installed but before the user is told to 
 
 The call is deliberately non-blocking: if the bootloader update fails (hardware RAID, unusual topology, read-only ESP), a warning is printed but `freebsd-update install` still succeeds. The user is given clear instructions for manual remediation.
 
-**Typical upgrade** (BOOTx64.efi is a FreeBSD loader — Guard 1 fires, no NVRAM write):
+**Default behavior (`UpdateBootloader dry-run`):** The script evaluates whether any ESP files need updating, but makes no writes. If an update is recommended, a prominent advisory notice is printed to the console and recorded in syslog at `daemon.warn` (tag: `efi_bootloader_update`) with instructions to apply the update before rebooting. If all ESP files are already current, the modal is suppressed and no action is needed.
+
+To enable automatic writes, set `UpdateBootloader yes` in `/etc/freebsd-update.conf`, or run the script directly with `--confirm-update` after reviewing the dry-run output.
+
+**Default: dry-run with update pending** (BOOTx64.efi is a FreeBSD loader — Guard 1 fires, no NVRAM write):
 ```
 freebsd-update: [bootloader] INFO:  Boot method detected: UEFI
 freebsd-update: [bootloader] INFO:  Processing EFI partition: nda0 partition 1 (GPT)
-freebsd-update: [bootloader] INFO:  Updated: /tmp/tmp.XXXXXX/EFI/FreeBSD/loader.efi
-freebsd-update: [bootloader] INFO:  Updated: /tmp/tmp.XXXXXX/EFI/boot/BOOTx64.efi
-freebsd-update: [bootloader] INFO:  Fallback EFI binary is a FreeBSD loader — skipping NVRAM entry creation
+freebsd-update: [bootloader] INFO:  [DRY RUN] Would update: /boot/efi/EFI/FreeBSD/loader.efi
+freebsd-update: [bootloader] INFO:  [DRY RUN] Would update: /boot/efi/EFI/BOOT/BOOTx64.efi
+freebsd-update: [bootloader] INFO:  Updating BIOS bootcode on nda0p2 (zfs)
+freebsd-update: [bootloader] INFO:  [DRY RUN] gpart bootcode -b /boot/pmbr -p /boot/gptzfsboot -i 2 nda0
+
+*** ============================================================
+*** NOTICE: EFI bootloader update recommended
+*** ============================================================
+***
+*** ESP:       /dev/nda0p1  (/boot/efi)
+*** Installed: EFI/FreeBSD/loader.efi
+***            2024-04-03 07:54 UTC
+*** Available: /boot/loader.efi
+***            2025-09-26 17:12 UTC
+*** FreeBSD:   fingerprint confirmed (bootprog_info match)
+*** ------------------------------------------------------------
+*** WARNING: No changes were made (dry-run mode).
+*** Update the bootloader BEFORE rebooting into the new kernel.
+*** Failure to do so may result in a boot failure.
+*** ------------------------------------------------------------
+***
+*** To apply now (as root):
+***   sh /usr/libexec/efi_bootloader_update.sh --confirm-update
+***
+*** To apply automatically on future upgrades:
+***   Set  UpdateBootloader yes  in /etc/freebsd-update.conf
+*** ============================================================
+```
+
+**With `UpdateBootloader yes` or `--confirm-update`** (writes performed):
+```
+freebsd-update: [bootloader] INFO:  Boot method detected: UEFI
+freebsd-update: [bootloader] INFO:  Processing EFI partition: nda0 partition 1 (GPT)
+freebsd-update: [bootloader] INFO:  Updated: /boot/efi/EFI/FreeBSD/loader.efi
+freebsd-update: [bootloader] INFO:  Updated: /boot/efi/EFI/BOOT/BOOTx64.efi
 freebsd-update: [bootloader] INFO:  Updated 2 EFI loader file(s) on /dev/nda0p1
 freebsd-update: [bootloader] INFO:  Updating BIOS bootcode on nda0p2 (zfs)
 freebsd-update: [bootloader] INFO:  Bootloader update complete
 ```
 
-**Promote case** (BOOTx64.efi owned by another OS, no existing FreeBSD NVRAM entry — NVRAM entry created):
+**Promote case** (BOOTx64.efi owned by another OS, no existing FreeBSD NVRAM entry):
 ```
 freebsd-update: [bootloader] INFO:  Boot method detected: UEFI
 freebsd-update: [bootloader] INFO:  Processing EFI partition: nda0 partition 1 (GPT)
-freebsd-update: [bootloader] INFO:  Creating /tmp/tmp.XXXXXX/EFI/FreeBSD/ and installing loader
-freebsd-update: [bootloader] INFO:  Updated: /tmp/tmp.XXXXXX/EFI/FreeBSD/loader.efi
+freebsd-update: [bootloader] INFO:  Creating /boot/efi/EFI/FreeBSD/ and installing loader
+freebsd-update: [bootloader] INFO:  Updated: /boot/efi/EFI/FreeBSD/loader.efi
 freebsd-update: [bootloader] INFO:  Adding NVRAM boot entry: FreeBSD → \EFI\FreeBSD\loader.efi
 freebsd-update: [bootloader] INFO:  NVRAM boot entry created
 freebsd-update: [bootloader] INFO:  Updated 1 EFI loader file(s) on /dev/nda0p1
@@ -279,7 +315,8 @@ freebsd-update: [bootloader] INFO:  Bootloader update complete
 | Variable | Default | Description |
 |---|---|---|
 | `EFI_LOADER_SRC` | `/boot/loader.efi` | Source loader to copy to ESP |
-| `EFI_DRY_RUN` | `0` | Set to `1` to show actions without executing |
+| `EFI_DRY_RUN` | `1`* | Set to `1` to evaluate without writing. Implied when `EFI_CONFIRM_UPDATE` is not set. |
+| `EFI_CONFIRM_UPDATE` | `0` | Set to `1` to perform writes. Equivalent to `--confirm-update`. `EFI_DRY_RUN=1` takes precedence if both are set. |
 | `EFI_VERBOSE` | `0` | Set to `1` for debug output |
 | `EFI_NVRAM_UPDATE` | `1` | Set to `0` to skip NVRAM boot entry management |
 | `EFI_BIOS_PMBR` | `/boot/pmbr` | PMBR boot record for BIOS boot |
@@ -288,7 +325,9 @@ freebsd-update: [bootloader] INFO:  Bootloader update complete
 | `_EFI_LOADER_IA32_SRC` | `/boot/loader_ia32.efi` | Source binary for the 32-bit EFI fallback loader (amd64 14.3+ only; absent on 13.x and 14.0–14.2; skip if not present). Leading underscore denotes an override variable — not part of the primary public interface. |
 | `EFI_INSTALL_IA32` | `0` | Set to `1` to install `BOOTia32.efi` fresh onto an ESP that does not already have one. Use on a dual-boot shared Windows ESP or a portable drive that must boot on both 32-bit and 64-bit UEFI firmware. On systems provisioned by `bsdinstall`, `BOOTia32.efi` is placed by the installer and updated automatically without this flag. |
 
-To skip only NVRAM boot entry management while still updating ESP files, set `UpdateBootloaderNVRAM no` in `freebsd-update.conf` (use when NVRAM entries are managed externally via BMC, Ansible, etc.). To disable all bootloader updates, set `UpdateBootloader no` — this also skips NVRAM.
+\* `EFI_DRY_RUN` defaults to `1` when the script is invoked directly with no flags and `EFI_CONFIRM_UPDATE` is not set. `freebsd-update` sets these env vars explicitly based on the `UpdateBootloader` conf value.
+
+`UpdateBootloader` in `freebsd-update.conf` accepts three values: `dry-run` (default — evaluate and notify), `yes` (perform write), or `no` (disable entirely). To skip only NVRAM boot entry management while still updating ESP files, set `UpdateBootloaderNVRAM no` in `freebsd-update.conf` (use when NVRAM entries are managed externally via BMC, Ansible, etc.).
 
 ---
 
